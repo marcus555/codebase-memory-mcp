@@ -945,9 +945,75 @@ static char *parse_comparison_op(parser_t *p) {
 }
 
 /* Parse a single condition: var.prop OP value | var.prop IS [NOT] NULL | var.prop IN [...] */
+/* Free the heap fields of a standalone node pattern (not owned by a pattern). */
+static void free_one_node_pattern(cbm_node_pattern_t *n) {
+    safe_str_free(&n->variable);
+    safe_str_free(&n->label);
+    for (int j = 0; j < n->prop_count; j++) {
+        safe_str_free(&n->props[j].key);
+        safe_str_free(&n->props[j].value);
+    }
+    free(n->props);
+    memset(n, 0, sizeof(*n));
+}
+
+/* Free the heap fields of a standalone relationship pattern. */
+static void free_one_rel_pattern(cbm_rel_pattern_t *r) {
+    safe_str_free(&r->variable);
+    for (int j = 0; j < r->type_count; j++) {
+        safe_str_free(&r->types[j]);
+    }
+    free(r->types);
+    safe_str_free(&r->direction);
+    memset(r, 0, sizeof(*r));
+}
+
+/* Parse a bounded EXISTS predicate: EXISTS { (anchor)-[:TYPE]->() } — a
+ * single-hop, edge-type-specific existence check anchored on a bound variable
+ * (e.g. WHERE NOT EXISTS { (f)<-[:CALLS]-() } finds functions with no callers).
+ * Multi-hop / nested-WHERE EXISTS is intentionally unsupported. */
+static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
+    advance(p); /* EXISTS */
+    if (!match(p, TOK_LBRACE)) {
+        snprintf(p->error, sizeof(p->error), "expected '{' after EXISTS at pos %d", peek(p)->pos);
+        return NULL;
+    }
+    cbm_node_pattern_t anchor = {0};
+    cbm_rel_pattern_t rel = {0};
+    cbm_node_pattern_t far = {0};
+    if (parse_node(p, &anchor) < 0 || parse_rel(p, &rel) < 0 || parse_node(p, &far) < 0) {
+        free_one_node_pattern(&anchor);
+        free_one_rel_pattern(&rel);
+        free_one_node_pattern(&far);
+        snprintf(p->error, sizeof(p->error),
+                 "unsupported EXISTS pattern — only the single-hop form "
+                 "'(var)-[:TYPE]->()' is supported");
+        return NULL;
+    }
+    expect(p, TOK_RBRACE);
+
+    cbm_condition_t c = {0};
+    c.negated = negated;
+    c.op = heap_strdup("EXISTS");
+    c.variable = heap_strdup(anchor.variable ? anchor.variable : "");
+    c.value = (rel.type_count > 0 && rel.types[0]) ? heap_strdup(rel.types[0]) : NULL;
+    c.exists_dir = (rel.direction && strcmp(rel.direction, "inbound") == 0) ? 1
+                   : (rel.direction && strcmp(rel.direction, "any") == 0)   ? 2
+                                                                            : 0;
+    free_one_node_pattern(&anchor);
+    free_one_rel_pattern(&rel);
+    free_one_node_pattern(&far);
+    return expr_leaf(c);
+}
+
 static cbm_expr_t *parse_condition_expr(parser_t *p) {
     /* Check for NOT prefix at condition level (e.g. NOT n.name CONTAINS "x") */
     bool negated = match(p, TOK_NOT);
+
+    /* EXISTS { pattern } predicate (anchored single-hop existence). */
+    if (check(p, TOK_EXISTS)) {
+        return parse_exists_predicate(p, negated);
+    }
 
     const cbm_token_t *var = expect(p, TOK_IDENT);
     if (!var) {
@@ -2271,6 +2337,38 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
     if (strcmp(c->op, "HAS_LABEL") == 0) {
         cbm_node_t *n = binding_get(b, c->variable);
         bool result = n && n->label && c->value && strcmp(n->label, c->value) == 0;
+        return c->negated ? !result : result;
+    }
+
+    /* EXISTS { (var)-[:TYPE]->() }: does the bound node have any edge of the
+     * given type in the requested direction? (dir 0=out, 1=in, 2=any) */
+    if (strcmp(c->op, "EXISTS") == 0) {
+        cbm_node_t *n = binding_get(b, c->variable);
+        bool result = false;
+        if (n && b->store) {
+            cbm_edge_t *edges = NULL;
+            int cnt = 0;
+            if (c->exists_dir != 1) { /* outbound or any */
+                if (c->value) {
+                    cbm_store_find_edges_by_source_type(b->store, n->id, c->value, &edges, &cnt);
+                } else {
+                    cbm_store_find_edges_by_source(b->store, n->id, &edges, &cnt);
+                }
+                result = cnt > 0;
+                cbm_store_free_edges(edges, cnt);
+            }
+            if (!result && c->exists_dir != 0) { /* inbound or any */
+                edges = NULL;
+                cnt = 0;
+                if (c->value) {
+                    cbm_store_find_edges_by_target_type(b->store, n->id, c->value, &edges, &cnt);
+                } else {
+                    cbm_store_find_edges_by_target(b->store, n->id, &edges, &cnt);
+                }
+                result = cnt > 0;
+                cbm_store_free_edges(edges, cnt);
+            }
+        }
         return c->negated ? !result : result;
     }
 

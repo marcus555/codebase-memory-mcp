@@ -263,6 +263,14 @@ COALV=$(cyp_first_cell 'MATCH (f:Function) RETURN coalesce(f.nonesuch, f.name) A
 if [ -z "$COALV" ]; then echo "FAIL: query_graph coalesce(...) returned empty"; exit 1; fi
 echo "OK: query_graph coalesce(f.nonesuch, f.name) = $COALV"
 
+# EXISTS { } pattern predicate (edge-type-specific existence)
+CYPHER_EX=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE EXISTS { (f)-[:CALLS]->() } RETURN f.name\"}")
+EX_ROWS=$(echo "$CYPHER_EX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+if [ "$EX_ROWS" -lt 1 ]; then
+  echo "FAIL: query_graph EXISTS{} predicate returned 0 rows"; echo "$CYPHER_EX"; exit 1
+fi
+echo "OK: query_graph EXISTS { (f)-[:CALLS]->() } returned $EX_ROWS row(s)"
+
 # =~ regex match in WHERE
 CYPHER_RX=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE f.name =~ \\\".+\\\" RETURN f.name\"}")
 RX_ROWS=$(echo "$CYPHER_RX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")

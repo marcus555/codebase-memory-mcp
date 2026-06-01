@@ -191,6 +191,10 @@ typedef struct {
     bool negated;           /* NOT prefix */
     const char **in_values; /* IN [...] list */
     int in_value_count;
+    /* EXISTS { (var)-[:value]->() } predicate (op=="EXISTS"): `variable` is the
+     * anchor, `value` the edge type (NULL = any), `exists_dir` the direction
+     * (0 = outbound, 1 = inbound, 2 = any). */
+    int exists_dir;
 } cbm_condition_t;
 
 /* Expression tree for WHERE clause */
