@@ -30,7 +30,9 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
+#if !defined(_WIN32)
+#include <sys/wait.h> /* fork/waitpid crash isolation — POSIX only */
+#endif
 
 /* ── Shared harness: index one fixture file through the production pipeline ── */
 
@@ -190,8 +192,20 @@ static int type_like_nodes(cbm_store_t *store, const char *project) {
 /* Run cbm_extract_file in a forked child; return true if the child died from a
  * signal (SIGBUS/SIGSEGV/...). ASan does not install a SIGBUS handler, so an
  * in-process crash would terminate the whole test runner — forking isolates it
- * and lets us assert "extraction must not crash" deterministically. */
+ * and lets us assert "extraction must not crash" deterministically.
+ *
+ * Windows (msys2) has no fork()/waitpid(): run in-process. A genuine crash there
+ * aborts the runner (a hard, visible failure), and the fork-isolated check still
+ * runs on the POSIX CI legs, so coverage is preserved. */
 static bool extract_crashes(const char *content, CBMLanguage lang, const char *relpath) {
+#if defined(_WIN32)
+    CBMFileResult *r =
+        cbm_extract_file(content, (int)strlen(content), lang, "lc", relpath, 0, NULL, NULL);
+    if (r) {
+        cbm_free_result(r);
+    }
+    return false;
+#else
     fflush(NULL);
     pid_t pid = fork();
     if (pid < 0) {
@@ -208,6 +222,7 @@ static bool extract_crashes(const char *content, CBMLanguage lang, const char *r
     int status = 0;
     (void)waitpid(pid, &status, 0);
     return WIFSIGNALED(status);
+#endif
 }
 
 /* ══════════════════════════════════════════════════════════════════
