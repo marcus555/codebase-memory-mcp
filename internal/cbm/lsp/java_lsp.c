@@ -2267,6 +2267,17 @@ static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
     if (resolved && resolved->signature && resolved->signature->kind == CBM_TYPE_FUNC) {
         param_types = resolved->signature->data.func.param_types;
     }
+    /* param_types is NULL-terminated with the DECLARED param count — the call
+     * site may pass MORE arguments (overload mismatch, varargs). Indexing by
+     * the raw argument index read past the terminator and dereferenced
+     * whatever followed in the arena (elasticsearch SIGSEGV; same OOB family
+     * as #427). Bound every access by the array's own length. */
+    int param_type_count = 0;
+    if (param_types) {
+        while (param_types[param_type_count]) {
+            param_type_count++;
+        }
+    }
     /* Even without registry param_types, the heuristic (recv_qn + method_name
      * → arg shape) often pins the lambda type — that's the path that
      * handles `xs.forEach(x -> ...)` and `xs.stream().filter(x -> ...)`
@@ -2296,7 +2307,8 @@ static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
             continue;
 
         /* First try registry-driven SAM inference. */
-        const CBMType *expected = param_types ? param_types[i] : NULL;
+        const CBMType *expected =
+            (param_types && i < (uint32_t)param_type_count) ? param_types[i] : NULL;
         if (!expected && recv_qn && mname && recv_targ_count > 0) {
             /* Heuristic path: bind lambda directly using receiver template
              * args + recognized method name, skipping the SAM table. */
@@ -2521,7 +2533,16 @@ static void resolve_method_reference(JavaLSPContext *ctx, TSNode mref,
     if (outer_resolved && outer_resolved->signature &&
         outer_resolved->signature->kind == CBM_TYPE_FUNC &&
         outer_resolved->signature->data.func.param_types) {
-        const CBMType *expected = outer_resolved->signature->data.func.param_types[arg_index];
+        /* param_types is NULL-terminated with the DECLARED count; arg_index is
+         * the CALL-SITE index, which can exceed it (overload mismatch,
+         * varargs) — indexing past the terminator dereferences arena garbage
+         * (same OOB family as #427 / bind_lambda_args). */
+        const CBMType *const *pts = outer_resolved->signature->data.func.param_types;
+        int ptc = 0;
+        while (pts[ptc]) {
+            ptc++;
+        }
+        const CBMType *expected = (arg_index >= 0 && arg_index < ptc) ? pts[arg_index] : NULL;
         if (expected) {
             const char *fi_qn = NULL;
             if (expected->kind == CBM_TYPE_NAMED)
