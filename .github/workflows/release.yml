@@ -273,6 +273,24 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      # The packaged versions MUST match the dispatched release version —
+      # the 0.8.0 release failed here because pkg/npm still carried the
+      # previous release's hand-pinned version and npm refuses to publish
+      # over an existing version. Inject the dispatch input so a forgotten
+      # manual bump can never fail the pipeline again. (server.json needs
+      # no injection: publish-mcp-registry syncs it from pkg/npm.)
+      - name: Sync packaging versions to the release version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          V="${RELEASE_VERSION#v}"
+          jq --arg v "$V" '.version = $v' pkg/npm/package.json > pkg/npm/package.tmp
+          mv pkg/npm/package.tmp pkg/npm/package.json
+          sed -i "s/^version = \".*\"/version = \"$V\"/" pkg/pypi/pyproject.toml
+          grep -q "\"version\": \"$V\"" pkg/npm/package.json
+          grep -q "^version = \"$V\"" pkg/pypi/pyproject.toml
+          echo "packaging synced to $V"
+
       # ── npm ──────────────────────────────────────────────────
       - name: Setup Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
