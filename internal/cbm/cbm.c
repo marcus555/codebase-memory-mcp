@@ -6,6 +6,7 @@
 #include "lsp/go_lsp.h"
 #include "lsp/c_lsp.h"
 #include "lsp/php_lsp.h"
+#include "lsp/perl_lsp.h"
 #include "lsp/py_lsp.h"
 #include "lsp/ts_lsp.h"
 #include "lsp/cs_lsp.h"
@@ -956,6 +957,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         }
         if (language == CBM_LANG_PHP) {
             cbm_run_php_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_PERL) {
+            cbm_run_perl_lsp(a, result, source, source_len, root);
         }
         if (language == CBM_LANG_PYTHON) {
             cbm_run_py_lsp(a, result, source, source_len, root);
