@@ -46,8 +46,6 @@ static inline void *intptr_to_ptr(intptr_t v) {
     return p;
 }
 
-const char *cbm_artifact_export_last_error(void);
-
 /* ── Global index lock ─────────────────────────────────────────── */
 /* Prevents concurrent pipeline runs on the same DB file.
  * Atomic spinlock: 0 = free, 1 = locked. */
@@ -853,6 +851,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         if (arc != 0) {
             const char *err = cbm_artifact_export_last_error();
             cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
+            /* A failed persistence export intentionally fails the run; this used to be ignored. */
             return arc;
         }
     }

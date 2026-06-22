@@ -32,6 +32,10 @@ enum {
 int cbm_artifact_export(const char *db_path, const char *repo_path, const char *project_name,
                         int quality);
 
+/* Get details for the most recent export failure on this thread.
+ * Returns NULL if no export error is recorded. */
+const char *cbm_artifact_export_last_error(void);
+
 /* Import artifact from .codebase-memory/graph.db.zst to cache_db_path.
  * Decompresses, runs integrity check, recreates indexes.
  * Returns 0 on success, -1 on error. */

@@ -21,8 +21,6 @@ enum { ART_TEST_LOG_BUF = 32768 };
 static char g_log_capture[ART_TEST_LOG_BUF];
 static CBMLogLevel g_prev_log_level;
 
-const char *cbm_artifact_export_last_error(void);
-
 static void setup_artifact_test(void) {
     snprintf(g_tmpdir, sizeof(g_tmpdir), "%s/cbm_test_artifact_XXXXXX", cbm_tmpdir());
     cbm_mkdtemp(g_tmpdir);

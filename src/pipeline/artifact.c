@@ -36,6 +36,9 @@ enum {
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -180,15 +183,21 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
     }
 
 #ifdef _WIN32
-    /* C rename() does not reliably replace an existing destination on Windows. */
-    cbm_unlink(path);
-#endif
+    /* MoveFileEx replace approach suggested by @Ayush7Ranjan in #492. */
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DWORD saved_error = GetLastError();
+        cbm_unlink(tmp);
+        file_error_set(out_err, "rename_temp", (int)saved_error);
+        return CBM_NOT_FOUND;
+    }
+#else
     if (rename(tmp, path) != 0) {
         int saved_errno = errno;
         cbm_unlink(tmp);
         file_error_set(out_err, "rename_temp", saved_errno);
         return CBM_NOT_FOUND;
     }
+#endif
     return 0;
 }
 
