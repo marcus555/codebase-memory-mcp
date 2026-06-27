@@ -2606,19 +2606,19 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     (void)sel; /* union across all same-name nodes — see bfs_union_same_name (#546) */
 
     if (do_outbound) {
-        bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count, depth,
-                            &tr_out);
-        yyjson_mut_obj_add_val(doc, root, "callees",
-                               bfs_to_json_array(doc, &tr_out, risk_labels, include_tests,
-                                                 data_flow));
+        bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
+                            depth, &tr_out);
+        yyjson_mut_obj_add_val(
+            doc, root, "callees",
+            bfs_to_json_array(doc, &tr_out, risk_labels, include_tests, data_flow));
     }
 
     if (do_inbound) {
         bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count, depth,
                             &tr_in);
-        yyjson_mut_obj_add_val(doc, root, "callers",
-                               bfs_to_json_array(doc, &tr_in, risk_labels, include_tests,
-                                                 data_flow));
+        yyjson_mut_obj_add_val(
+            doc, root, "callers",
+            bfs_to_json_array(doc, &tr_in, risk_labels, include_tests, data_flow));
     }
 
     /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
@@ -4420,8 +4420,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
          * prefix when present so all three sources yield clean paths; for a
          * rename ("R  old -> new") keep the post-arrow destination path. */
         char *path_line = line;
-        if (len > PAIR_LEN && line[PAIR_LEN] == ' ' &&
-            strchr(" MADRCU?!", line[0]) && strchr(" MADRCU?!", line[1])) {
+        if (len > PAIR_LEN && line[PAIR_LEN] == ' ' && strchr(" MADRCU?!", line[0]) &&
+            strchr(" MADRCU?!", line[1])) {
             path_line = line + PAIR_LEN + SKIP_ONE;
             char *arrow = strstr(path_line, " -> ");
             if (arrow) {
