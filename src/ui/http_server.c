@@ -135,6 +135,67 @@ typedef struct {
 
 static index_job_t g_index_jobs[MAX_INDEX_JOBS];
 
+/* Quote one argv token for Windows' single command-line string.
+ * CreateProcessA does not accept an argv array; the child CRT reconstructs argv
+ * from one string. JSON arguments contain quotes, so passing raw JSON through
+ * this path strips the JSON quotes and makes repo_path disappear. Use normal CLI
+ * flags and quote each token with the documented CRT backslash/quote rules. */
+#ifdef _WIN32
+static bool append_win_quoted_arg(char *dst, size_t dst_sz, size_t *pos, const char *arg) {
+    if (!dst || !pos || !arg || *pos >= dst_sz) {
+        return false;
+    }
+    if (*pos > 0) {
+        if (*pos + 1 >= dst_sz)
+            return false;
+        dst[(*pos)++] = ' ';
+    }
+    if (*pos + 1 >= dst_sz)
+        return false;
+    dst[(*pos)++] = '"';
+
+    int backslashes = 0;
+    for (const char *p = arg; *p; p++) {
+        if (*p == '\\') {
+            backslashes++;
+            continue;
+        }
+        if (*p == '"') {
+            for (int i = 0; i < backslashes * 2 + 1; i++) {
+                if (*pos + 1 >= dst_sz)
+                    return false;
+                dst[(*pos)++] = '\\';
+            }
+            backslashes = 0;
+            if (*pos + 1 >= dst_sz)
+                return false;
+            dst[(*pos)++] = '"';
+            continue;
+        }
+        while (backslashes-- > 0) {
+            if (*pos + 1 >= dst_sz)
+                return false;
+            dst[(*pos)++] = '\\';
+        }
+        backslashes = 0;
+        if (*pos + 1 >= dst_sz)
+            return false;
+        dst[(*pos)++] = *p;
+    }
+
+    for (int i = 0; i < backslashes * 2; i++) {
+        if (*pos + 1 >= dst_sz)
+            return false;
+        dst[(*pos)++] = '\\';
+    }
+    if (*pos + 1 >= dst_sz)
+        return false;
+    dst[(*pos)++] = '"';
+    dst[*pos] = '\0';
+    return true;
+}
+#endif
+
 /* ── Serve embedded asset ─────────────────────────────────────── */
 
 static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
@@ -767,26 +828,26 @@ static void *index_thread_fn(void *arg) {
 
     char log_file[256];
 
-    /* JSON-escape root_path and optional project name. */
-    char escaped_path[2048];
-    cbm_json_escape(escaped_path, (int)sizeof(escaped_path), job->root_path);
-    char escaped_name[512];
-    cbm_json_escape(escaped_name, (int)sizeof(escaped_name), job->project_name);
-    char json_arg[4096];
-    if (job->project_name[0]) {
-        snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\",\"name\":\"%s\"}", escaped_path,
-                 escaped_name);
-    } else {
-        snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\"}", escaped_path);
-    }
-
 #ifdef _WIN32
     snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d.log",
              getenv("TEMP") ? getenv("TEMP") : ".", (int)_getpid());
 
-    /* Build command line for CreateProcess */
-    char cmdline[2048];
-    snprintf(cmdline, sizeof(cmdline), "\"%s\" cli index_repository \"%s\"", bin, json_arg);
+    char cmdline[4096] = {0};
+    size_t cmd_pos = 0;
+    bool cmd_ok = append_win_quoted_arg(cmdline, sizeof(cmdline), &cmd_pos, bin) &&
+                  append_win_quoted_arg(cmdline, sizeof(cmdline), &cmd_pos, "cli") &&
+                  append_win_quoted_arg(cmdline, sizeof(cmdline), &cmd_pos, "index_repository") &&
+                  append_win_quoted_arg(cmdline, sizeof(cmdline), &cmd_pos, "--repo-path") &&
+                  append_win_quoted_arg(cmdline, sizeof(cmdline), &cmd_pos, job->root_path);
+    if (cmd_ok && job->project_name[0]) {
+        cmd_ok = append_win_quoted_arg(cmdline, sizeof(cmdline), &cmd_pos, "--name") &&
+                 append_win_quoted_arg(cmdline, sizeof(cmdline), &cmd_pos, job->project_name);
+    }
+    if (!cmd_ok) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "command line too long");
+        atomic_store(&job->status, 3);
+        return NULL;
+    }
 
     cbm_log_info("ui.index.spawn", "bin", bin, "log", log_file);
 
@@ -854,7 +915,13 @@ static void *index_thread_fn(void *arg) {
         FILE *lf = freopen(log_file, "w", stderr);
         (void)lf;
         freopen("/dev/null", "w", stdout);
-        execl(bin, bin, "cli", "index_repository", json_arg, (char *)NULL);
+        if (job->project_name[0]) {
+            execl(bin, bin, "cli", "index_repository", "--repo-path", job->root_path, "--name",
+                  job->project_name, (char *)NULL);
+        } else {
+            execl(bin, bin, "cli", "index_repository", "--repo-path", job->root_path,
+                  (char *)NULL);
+        }
         _exit(127);
     }
 
