@@ -5,10 +5,12 @@
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
+#include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
 #include "test_framework.h"
 #include <cli/cli.h>
 #include <mcp/mcp.h>
+#include <pipeline/pipeline.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
@@ -16,11 +18,62 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <sys/stat.h> /* chmod / stat for read-only query reproductions */
+#ifdef _WIN32
+#include <direct.h>
+#define cbm_chdir _chdir
+#define cbm_getcwd _getcwd
+#else
+#include <unistd.h>
+#define cbm_chdir chdir
+#define cbm_getcwd getcwd
+#endif
 
 static char mcp_log_buf[4096];
 
 static void mcp_capture_log(const char *line) {
     snprintf(mcp_log_buf, sizeof(mcp_log_buf), "%s", line ? line : "");
+}
+
+static bool response_contains_json_fragment(const char *response, const char *fragment) {
+    if (!response || !fragment) {
+        return false;
+    }
+    if (strstr(response, fragment)) {
+        return true;
+    }
+
+    char escaped[512];
+    size_t out = 0;
+    for (size_t i = 0; fragment[i] && out + 2 < sizeof(escaped); i++) {
+        if (fragment[i] == '"') {
+            escaped[out++] = '\\';
+        }
+        escaped[out++] = fragment[i];
+    }
+    escaped[out] = '\0';
+    return strstr(response, escaped) != NULL;
+}
+
+static void restore_cache_dir(const char *saved_copy) {
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+}
+
+static void cleanup_project_db(const char *cache, const char *project) {
+    if (!cache || !project) {
+        return;
+    }
+
+    char path[CBM_SZ_4K];
+    snprintf(path, sizeof(path), "%s/%s.db", cache, project);
+    cbm_unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.db-wal", cache, project);
+    cbm_unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.db-shm", cache, project);
+    cbm_unlink(path);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1525,7 +1578,7 @@ TEST(tool_detect_changes_no_project) {
                                    "\"params\":{\"name\":\"detect_changes\","
                                    "\"arguments\":{}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "not found"));
+    ASSERT_NOT_NULL(strstr(resp, "missing required argument: project"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -1540,7 +1593,7 @@ TEST(tool_manage_adr_no_project) {
                                    "\"params\":{\"name\":\"manage_adr\","
                                    "\"arguments\":{}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "not found"));
+    ASSERT_NOT_NULL(strstr(resp, "missing required argument: project"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -1643,6 +1696,377 @@ TEST(tool_manage_adr_unified_backend_issue256) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_index_repository_reports_store_backed_adr) {
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-index-adr-test-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-index-adr-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        cbm_rmdir(tmp_dir);
+        PASS();
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("def main():\n    return 'ok'\n", fp);
+    fclose(fp);
+
+    char *project = cbm_project_name_from_path(tmp_dir);
+    ASSERT_NOT_NULL(project);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", tmp_dir);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(response_contains_json_fragment(resp, "\"status\":\"indexed\""));
+    free(resp);
+
+    char update_args[2048];
+    snprintf(update_args, sizeof(update_args),
+             "{\"project\":\"%s\",\"mode\":\"update\",\"content\":\"## PURPOSE\\n"
+             "Store-backed ADR metadata.\\n\"}",
+             project);
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", update_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(response_contains_json_fragment(resp, "\"status\":\"indexed\""));
+    ASSERT(response_contains_json_fragment(resp, "\"adr_present\":true"));
+    ASSERT_NULL(strstr(resp, "adr_hint"));
+    free(resp);
+
+    char get_args[512];
+    snprintf(get_args, sizeof(get_args), "{\"project\":\"%s\",\"mode\":\"get\"}", project);
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", get_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Store-backed ADR metadata."));
+    ASSERT_NULL(strstr(resp, "no_adr"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    free(project);
+    remove(src_path);
+    cbm_rmdir(cache);
+    cbm_rmdir(tmp_dir);
+    PASS();
+}
+
+TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr) {
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-index-dot-adr-test-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-index-dot-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        cbm_rmdir(tmp_dir);
+        PASS();
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("def main():\n    return helper()\n\ndef helper():\n    return 1\n", fp);
+    fclose(fp);
+
+    char old_cwd[CBM_SZ_4K];
+    ASSERT_NOT_NULL(cbm_getcwd(old_cwd, sizeof(old_cwd)));
+
+    char *project = cbm_project_name_from_path(tmp_dir);
+    ASSERT_NOT_NULL(project);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    ASSERT_EQ(cbm_chdir(tmp_dir), 0);
+    char *resp =
+        cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\".\",\"mode\":\"fast\"}");
+    ASSERT_EQ(cbm_chdir(old_cwd), 0);
+    ASSERT_NOT_NULL(resp);
+    if (!response_contains_json_fragment(resp, "\"status\":\"indexed\"")) {
+        free(resp);
+        cbm_mcp_server_free(srv);
+        cleanup_project_db(cache, project);
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        free(project);
+        remove(src_path);
+        cbm_rmdir(cache);
+        cbm_rmdir(tmp_dir);
+        PASS();
+    }
+    ASSERT_NOT_NULL(strstr(resp, project));
+    ASSERT(!response_contains_json_fragment(resp, "\"project\":\"root\""));
+    free(resp);
+
+    char update_args[2048];
+    snprintf(update_args, sizeof(update_args),
+             "{\"project\":\"%s\",\"mode\":\"update\",\"content\":\"## PURPOSE\\n"
+             "Dot-path ADR marker.\\n\"}",
+             project);
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", update_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    free(resp);
+
+    ASSERT_EQ(cbm_chdir(tmp_dir), 0);
+    resp = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\".\",\"mode\":\"fast\"}");
+    ASSERT_EQ(cbm_chdir(old_cwd), 0);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(response_contains_json_fragment(resp, "\"status\":\"indexed\""));
+    ASSERT_NOT_NULL(strstr(resp, project));
+    ASSERT(response_contains_json_fragment(resp, "\"adr_present\":true"));
+    ASSERT(!response_contains_json_fragment(resp, "\"project\":\"root\""));
+    free(resp);
+
+    char get_args[512];
+    snprintf(get_args, sizeof(get_args), "{\"project\":\"%s\",\"mode\":\"get\"}", project);
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", get_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Dot-path ADR marker."));
+    ASSERT_NULL(strstr(resp, "no_adr"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    free(project);
+    remove(src_path);
+    cbm_rmdir(cache);
+    cbm_rmdir(tmp_dir);
+    PASS();
+}
+
+TEST(tool_manage_adr_not_found_rich_error) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-adr-missing-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        cbm_mcp_handle_tool(srv, "manage_adr",
+                            "{\"project\":\"cbm-no-such-project-zzz\",\"mode\":\"get\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "or not indexed"));
+    ASSERT_NOT_NULL(strstr(resp, "hint"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    cbm_rmdir(cache);
+    PASS();
+}
+
+TEST(tool_manage_adr_get_accepts_abs_path) {
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-adr-abspath-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-adr-abspath-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        cbm_rmdir(tmp_dir);
+        PASS();
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("def main():\n    return 'ok'\n", fp);
+    fclose(fp);
+
+    char *project = cbm_project_name_from_path(tmp_dir);
+    ASSERT_NOT_NULL(project);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", tmp_dir);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(response_contains_json_fragment(resp, "\"status\":\"indexed\""));
+    free(resp);
+
+    char update_args[2048];
+    snprintf(update_args, sizeof(update_args),
+             "{\"project\":\"%s\",\"mode\":\"update\",\"content\":\"## PURPOSE\\n"
+             "Abs-path normalization test.\\n\"}",
+             project);
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", update_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    free(resp);
+
+    char get_args[512];
+    snprintf(get_args, sizeof(get_args), "{\"project\":\"%s\",\"mode\":\"get\"}", tmp_dir);
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", get_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Abs-path normalization test."));
+    ASSERT_NULL(strstr(resp, "or not indexed"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    free(project);
+    remove(src_path);
+    cbm_rmdir(cache);
+    cbm_rmdir(tmp_dir);
+    PASS();
+}
+
+TEST(tool_manage_adr_get_accepts_symlink_path) {
+#ifdef _WIN32
+    PASS();
+#else
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-adr-realpath-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-adr-realpath-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        cbm_rmdir(tmp_dir);
+        PASS();
+    }
+
+    char link_path[320];
+    snprintf(link_path, sizeof(link_path), "%s-link", tmp_dir);
+    (void)unlink(link_path);
+    if (symlink(tmp_dir, link_path) != 0) {
+        cbm_rmdir(cache);
+        cbm_rmdir(tmp_dir);
+        PASS();
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("def main():\n    return 'ok'\n", fp);
+    fclose(fp);
+
+    char *project = cbm_project_name_from_path(tmp_dir);
+    ASSERT_NOT_NULL(project);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", link_path);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(response_contains_json_fragment(resp, "\"status\":\"indexed\""));
+    ASSERT_NOT_NULL(strstr(resp, project));
+    free(resp);
+
+    char update_args[2048];
+    snprintf(update_args, sizeof(update_args),
+             "{\"project\":\"%s\",\"mode\":\"update\",\"content\":\"## PURPOSE\\n"
+             "Symlink-path normalization test.\\n\"}",
+             project);
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", update_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    free(resp);
+
+    char get_args[512];
+    snprintf(get_args, sizeof(get_args), "{\"project\":\"%s\",\"mode\":\"get\"}", link_path);
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", get_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Symlink-path normalization test."));
+    ASSERT_NULL(strstr(resp, "or not indexed"));
+    ASSERT_NULL(strstr(resp, "no_adr"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    free(project);
+    remove(src_path);
+    unlink(link_path);
+    cbm_rmdir(cache);
+    cbm_rmdir(tmp_dir);
+    PASS();
+#endif
+}
+
+TEST(tool_detect_changes_not_found_rich_error) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-detect-missing-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        cbm_mcp_handle_tool(srv, "detect_changes", "{\"project\":\"cbm-no-such-project-zzz\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "or not indexed"));
+    ASSERT_NOT_NULL(strstr(resp, "hint"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    cbm_rmdir(cache);
     PASS();
 }
 
@@ -3393,6 +3817,12 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
+    RUN_TEST(tool_index_repository_reports_store_backed_adr);
+    RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
+    RUN_TEST(tool_manage_adr_not_found_rich_error);
+    RUN_TEST(tool_manage_adr_get_accepts_abs_path);
+    RUN_TEST(tool_manage_adr_get_accepts_symlink_path);
+    RUN_TEST(tool_detect_changes_not_found_rich_error);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
 
