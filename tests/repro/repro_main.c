@@ -53,6 +53,7 @@ static int cbm_suite_enabled(const char *name) {
 
 /* ── Repro suites (one per bug cluster / issue) ─────────────────── */
 extern void suite_repro_extraction(void);
+extern void suite_repro_parallel_determinism(void);
 extern void suite_repro_issue495(void);
 extern void suite_repro_issue521(void);
 extern void suite_repro_issue382(void);
@@ -134,6 +135,7 @@ int main(void) {
     printf("════════════════════════════════════════════════════════════\n");
 
     RUN_SUITE(repro_extraction);
+    RUN_SUITE(repro_parallel_determinism);
     RUN_SUITE(repro_issue495);
     RUN_SUITE(repro_issue521);
     RUN_SUITE(repro_issue382);

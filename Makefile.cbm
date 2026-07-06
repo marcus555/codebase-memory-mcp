@@ -412,6 +412,7 @@ TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
 # Kept out of the gating `make test` so `ci-ok` stays green; run via `make test-repro`.
 TEST_REPRO_SRCS = \
     tests/repro/repro_main.c \
+    tests/repro/repro_parallel_determinism.c \
     tests/repro/repro_extraction.c \
     tests/repro/repro_issue495.c \
     tests/repro/repro_issue521.c \
