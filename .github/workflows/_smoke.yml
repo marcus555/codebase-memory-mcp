@@ -225,13 +225,16 @@ jobs:
             cp "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" "codebase-memory-mcp-windows-${ARCH}.zip"
           fi
           sha256sum *.zip > checksums.txt
-          python3 -m http.server 18080 -d /tmp/smoke-server &
+          # Pin to explicit IPv4: on windows-11-arm, `localhost` resolves to ::1 (IPv6)
+          # for msys2 curl while python's http.server is IPv4-only -> instant connect
+          # failure in smoke Phase 12a. --bind 127.0.0.1 + a 127.0.0.1 URL pin both ends.
+          python3 -m http.server 18080 --bind 127.0.0.1 -d /tmp/smoke-server &
 
       - name: Smoke test
         shell: msys2 {0}
         run: scripts/smoke-test.sh ./codebase-memory-mcp.exe
         env:
-          SMOKE_DOWNLOAD_URL: http://localhost:18080
+          SMOKE_DOWNLOAD_URL: http://127.0.0.1:18080
 
       - name: Security audits
         shell: msys2 {0}
