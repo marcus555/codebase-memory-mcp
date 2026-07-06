@@ -7,6 +7,7 @@
 #include "foundation/compat_fs.h" /* cbm_mkdir_p, cbm_fopen */
 #include "foundation/log.h"
 #include "foundation/platform.h" /* cbm_resolve_cache_dir */
+#include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
 
 #include <stdio.h>
@@ -238,9 +239,15 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
      * available post-mortem instead of vanishing. Previously the log was ALWAYS
      * deleted and only outcome+signal were logged, so a worker that exited non-zero
      * left nothing to diagnose — the CI blind spot that hid this bug (a mangled JSON
-     * arg → "repo_path is required" exit) behind a generic "crashed on a file". */
-    if (r.outcome == CBM_PROC_CLEAN) {
+     * arg → "repo_path is required" exit) behind a generic "crashed on a file".
+     *
+     * Exception: under CBM_PROFILE the log IS the deliverable — the worker's
+     * msg=prof pass/sub-phase report is only written there, and deleting it on
+     * success made profiling clean runs impossible. Keep it and say where it is. */
+    if (r.outcome == CBM_PROC_CLEAN && !cbm_profile_active) {
         (void)remove(log_path);
+    } else if (r.outcome == CBM_PROC_CLEAN) {
+        cbm_log_info("index.supervisor.profile_log", "log", log_path);
     } else {
         cbm_log_warn("index.supervisor.worker_failed", "outcome", cbm_proc_outcome_str(r.outcome),
                      "exit_code", exit_buf, "log", log_path);
