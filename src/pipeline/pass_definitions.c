@@ -514,6 +514,26 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         const char *rel = files[i].rel_path;
         CBMLanguage lang = files[i].language;
 
+        /* Crash-quarantine skip (Stage 3c): the supervisor's single-threaded
+         * recovery re-run always lands on THIS sequential path (worker_count
+         * forced to 1). This first sequential pass REPORTS a crasher as a
+         * phase="crash" skip (surfacing it in skipped[]) and continues; later
+         * sequential passes (calls/usages/semantic) re-extract on a cache miss
+         * but hit the hard guard inside cbm_extract_file, so they no-op without
+         * re-crashing and without duplicating the skip. No-op unless
+         * CBM_INDEX_QUARANTINE_FILE is set. */
+        if (cbm_index_is_quarantined(rel)) {
+            const char *phase = cbm_index_quarantine_phase(rel);
+            if (!phase) {
+                phase = "crash";
+            }
+            const char *reason =
+                (strcmp(phase, "hang") == 0) ? "quarantined after hang" : "quarantined after crash";
+            cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, phase);
+            errors++;
+            continue;
+        }
+
         /* Read source file */
         int source_len = 0;
         long file_size = 0;

@@ -19,7 +19,13 @@
 #include "ui/layout3d.h"
 #include "mcp/mcp.h"
 #include "store/store.h"
+#include "watcher/watcher.h"
 #include "cli/cli.h"
+#include "git/git_context.h"
+
+#if defined(HAVE_LIBGIT2)
+#include <git2.h> /* git_repository_open, git_remote_lookup, git_remote_url */
+#endif
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
 #include "foundation/platform.h"
@@ -27,10 +33,13 @@
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
+#include "foundation/subprocess.h" /* cbm_build_win_cmdline — shared MS-CRT arg quoting */
+#include "foundation/win_utf8.h"   /* cbm_utf8_to_wide — CreateProcessW wide cmdline (#423/#20) */
 
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
 
+#include <errno.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -113,7 +122,8 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
 struct cbm_http_server {
     cbm_httpd_t *listener;
-    cbm_mcp_server_t *mcp; /* own MCP server instance (read-only) */
+    cbm_mcp_server_t *mcp;       /* own MCP server instance (read-only) */
+    struct cbm_watcher *watcher; /* external watcher ref (not owned) */
     atomic_int stop_flag;
     int port;
     bool listener_ok;
@@ -225,6 +235,171 @@ static void db_path_for_project(const char *project, char *buf, size_t bufsz) {
         dir = cbm_tmpdir();
     }
     snprintf(buf, bufsz, "%s/%s.db", dir, project);
+}
+
+/* ── Git remote → GitHub deep-link base (/api/repo-info) ───────── */
+
+/* Return a copy of `url` with any "user[:password]@" userinfo removed from the
+ * scheme://authority form, so credentials are never echoed back to the client.
+ * scp-style (git@host:path) is returned unchanged: "git" there is a login name,
+ * not a secret. malloc'd copy, or NULL when url is NULL. Caller frees. */
+char *cbm_ui_git_strip_credentials(const char *url) {
+    if (!url)
+        return NULL;
+    const char *sep = strstr(url, "://");
+    if (!sep)
+        return strdup(url); /* scp-style / opaque — no scheme userinfo to strip */
+    const char *authority = sep + 3;
+    const char *slash = strchr(authority, '/');
+    const char *at = strchr(authority, '@');
+    if (!at || (slash && at > slash))
+        return strdup(url); /* '@' is in the path, not the authority → no creds */
+    size_t prefix = (size_t)(authority - url); /* "scheme://" */
+    const char *rest = at + 1;
+    size_t out_len = prefix + strlen(rest) + 1;
+    char *out = malloc(out_len);
+    if (!out)
+        return NULL;
+    memcpy(out, url, prefix);
+    memcpy(out + prefix, rest, strlen(rest) + 1);
+    return out;
+}
+
+/* Normalize a git remote URL (scp-style, ssh://, https://) to a canonical
+ * "https://host/org/repo" web base with any trailing ".git" and any embedded
+ * credentials removed. Returns a malloc'd string or NULL if the shape isn't
+ * recognized. Caller frees. */
+char *cbm_ui_git_web_base(const char *url) {
+    if (!url || !url[0])
+        return NULL;
+    char host_path[1024] = {0}; /* "host/org/repo" */
+    if (strncmp(url, "git@", 4) == 0) {
+        const char *at = url + 4;
+        const char *colon = strchr(at, ':');
+        if (!colon)
+            return NULL;
+        snprintf(host_path, sizeof(host_path), "%.*s/%s", (int)(colon - at), at, colon + 1);
+    } else {
+        const char *p = strstr(url, "://");
+        if (!p)
+            return NULL;
+        p += 3;
+        const char *at = strchr(p, '@'); /* strip any embedded credentials */
+        if (at)
+            p = at + 1;
+        snprintf(host_path, sizeof(host_path), "%s", p);
+    }
+    size_t l = strlen(host_path);
+    if (l > 4 && strcmp(host_path + l - 4, ".git") == 0)
+        host_path[l - 4] = '\0';
+    l = strlen(host_path);
+    if (l > 0 && host_path[l - 1] == '/')
+        host_path[l - 1] = '\0';
+    size_t out_sz = strlen(host_path) + 9; /* "https://" (8) + NUL */
+    char *out = malloc(out_sz);
+    if (!out)
+        return NULL;
+    /* Legitimate GitHub blob-URL construction, not a network call — the scheme
+     * is https-forced here so the frontend deep-link can never be downgraded.
+     * Allow-listed in scripts/security-allowlist.txt (URL:https://%s). */
+    snprintf(out, out_sz, "https://%s", host_path);
+    return out;
+}
+
+/* Read the "origin" remote URL for the repo at root_path. malloc'd or NULL.
+ * libgit2 is initialized once at process start by cbm_alloc_init() (which also
+ * binds its allocator to mimalloc) — do NOT git_libgit2_init()/shutdown() here:
+ * a per-request shutdown could drop the global refcount and tear down that
+ * allocator binding mid-process. */
+static char *git_origin_remote_url(const char *root_path) {
+#if defined(HAVE_LIBGIT2)
+    git_repository *repo = NULL;
+    char *out = NULL;
+    if (git_repository_open(&repo, root_path) == 0) {
+        git_remote *rem = NULL;
+        if (git_remote_lookup(&rem, repo, "origin") == 0) {
+            const char *u = git_remote_url(rem);
+            if (u)
+                out = strdup(u);
+            git_remote_free(rem);
+        }
+        git_repository_free(repo);
+    }
+    return out;
+#else
+    (void)root_path;
+    return NULL;
+#endif
+}
+
+/* GET /api/repo-info?project=NAME → { root_path, branch, remote_url, web_base,
+ * blob_base }. blob_base is "<web_base>/blob/<branch>" ready for the frontend to
+ * append "/<file_path>#L<start>-L<end>". remote_url is credential-stripped;
+ * fields are empty strings when unknown (e.g. no git remote). */
+static void handle_repo_info(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    if (!cbm_http_query_param(req->query, "project", project, (int)sizeof(project)) ||
+        project[0] == '\0') {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing project parameter\"}");
+        return;
+    }
+
+    char db_path[1024];
+    db_path_for_project(project, db_path, sizeof(db_path));
+    if (db_path[0] == '\0' || !cbm_file_exists(db_path)) {
+        cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+        return;
+    }
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
+        return;
+    }
+
+    char root_path[1024] = {0};
+    cbm_project_t proj;
+    memset(&proj, 0, sizeof(proj));
+    if (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK && proj.root_path) {
+        snprintf(root_path, sizeof(root_path), "%s", proj.root_path);
+    }
+    cbm_project_free_fields(&proj);
+    cbm_store_close(store);
+
+    char branch[256] = {0};
+    if (root_path[0]) {
+        cbm_git_context_t gctx;
+        memset(&gctx, 0, sizeof(gctx));
+        if (cbm_git_context_resolve(root_path, &gctx) == 0 && gctx.branch) {
+            snprintf(branch, sizeof(branch), "%s", gctx.branch);
+        }
+        cbm_git_context_free(&gctx);
+    }
+
+    char *remote = root_path[0] ? git_origin_remote_url(root_path) : NULL;
+    char *remote_safe = cbm_ui_git_strip_credentials(remote); /* never echo secrets */
+    char *web_base = cbm_ui_git_web_base(remote);
+
+    char blob_base[1152] = {0};
+    if (web_base && web_base[0] && branch[0]) {
+        snprintf(blob_base, sizeof(blob_base), "%s/blob/%s", web_base, branch);
+    }
+
+    /* JSON-escape the free-form fields. */
+    char esc_root[2048], esc_branch[512], esc_remote[2048], esc_web[2048], esc_blob[2304];
+    cbm_json_escape(esc_root, (int)sizeof(esc_root), root_path);
+    cbm_json_escape(esc_branch, (int)sizeof(esc_branch), branch);
+    cbm_json_escape(esc_remote, (int)sizeof(esc_remote), remote_safe ? remote_safe : "");
+    cbm_json_escape(esc_web, (int)sizeof(esc_web), web_base ? web_base : "");
+    cbm_json_escape(esc_blob, (int)sizeof(esc_blob), blob_base);
+
+    cbm_http_replyf(c, 200, g_cors_json,
+                    "{\"root_path\":\"%s\",\"branch\":\"%s\",\"remote_url\":\"%s\","
+                    "\"web_base\":\"%s\",\"blob_base\":\"%s\"}",
+                    esc_root, esc_branch, esc_remote, esc_web, esc_blob);
+
+    free(remote);
+    free(remote_safe);
+    free(web_base);
 }
 
 /* ── Log ring buffer ──────────────────────────────────────────── */
@@ -832,6 +1007,7 @@ static void *index_thread_fn(void *arg) {
     snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d.log",
              getenv("TEMP") ? getenv("TEMP") : ".", (int)_getpid());
 
+    //TODO: check Solution
     char cmdline[4096] = {0};
     size_t cmd_pos = 0;
     bool cmd_ok = append_win_quoted_arg(cmdline, sizeof(cmdline), &cmd_pos, bin) &&
@@ -848,19 +1024,44 @@ static void *index_thread_fn(void *arg) {
         atomic_store(&job->status, 3);
         return NULL;
     }
+    /* Build command line for CreateProcess through the shared MS-CRT quoter so the
+     * JSON arg's embedded quotes survive the child's argv re-parse — a naive
+     * `"%s"` wrap dropped them, corrupting {"repo_path":"…"} into {repo_path:…}.
+     * --index-worker: this http_server spawn is already the crash-isolation layer,
+     * so the child runs indexing in-process rather than spawning its own supervisor
+     * (avoids redundant process nesting). */
+    char cmdline[2048];
+    const char *const idx_argv[] = {bin,      "cli", "--index-worker", "index_repository",
+                                    json_arg, NULL};
+    if (!cbm_build_win_cmdline(cmdline, sizeof(cmdline), idx_argv)) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "index command line too long");
+        atomic_store(&job->status, 3);
+        return NULL;
+    }
+    /* Wide command line: CreateProcessA would re-mangle the UTF-8 repo path through the
+     * ANSI code page at the spawn boundary, so a non-ASCII repo path never reaches the
+     * worker intact (#423/#20). Convert and spawn via CreateProcessW. */
+    wchar_t *wcmd = cbm_utf8_to_wide(cmdline);
+    if (!wcmd) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "index command line conversion failed");
+        atomic_store(&job->status, 3);
+        return NULL;
+    }
 
     cbm_log_info("ui.index.spawn", "bin", bin, "log", log_file);
 
     HANDLE hlog = CreateFileA(log_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, NULL);
-    STARTUPINFOA si_proc = {.cb = sizeof(si_proc)};
+    STARTUPINFOW si_proc = {.cb = sizeof(si_proc)};
     if (hlog != INVALID_HANDLE_VALUE) {
         si_proc.dwFlags = STARTF_USESTDHANDLES;
         si_proc.hStdError = hlog;
         si_proc.hStdOutput = hlog;
     }
     PROCESS_INFORMATION pi = {0};
-    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si_proc, &pi)) {
+    BOOL spawned = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, 0, NULL, NULL, &si_proc, &pi);
+    free(wcmd);
+    if (!spawned) {
         snprintf(job->error_msg, sizeof(job->error_msg), "CreateProcess failed");
         atomic_store(&job->status, 3);
         if (hlog != INVALID_HANDLE_VALUE)
@@ -915,6 +1116,7 @@ static void *index_thread_fn(void *arg) {
         FILE *lf = freopen(log_file, "w", stderr);
         (void)lf;
         freopen("/dev/null", "w", stdout);
+        //TODO: check Solution
         if (job->project_name[0]) {
             execl(bin, bin, "cli", "index_repository", "--repo-path", job->root_path, "--name",
                   job->project_name, (char *)NULL);
@@ -922,6 +1124,8 @@ static void *index_thread_fn(void *arg) {
             execl(bin, bin, "cli", "index_repository", "--repo-path", job->root_path,
                   (char *)NULL);
         }
+        // Alternative by Marcus
+        //execl(bin, bin, "cli", "--index-worker", "index_repository", json_arg, (char *)NULL);
         _exit(127);
     }
 
@@ -1057,8 +1261,15 @@ static void handle_index_status(cbm_http_conn_t *c) {
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
 
+static void unwatch_project(cbm_http_server_t *srv, const char *name) {
+    if (srv && srv->watcher) {
+        cbm_watcher_unwatch(srv->watcher, name);
+    }
+}
+
 /* DELETE /api/project?name=X — deletes the .db file */
-static void handle_delete_project(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
+                                  const cbm_http_req_t *req) {
     char name[256] = {0};
     if (!cbm_http_query_param(req->query, "name", name, (int)sizeof(name)) || name[0] == '\0') {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing name\"}");
@@ -1067,13 +1278,17 @@ static void handle_delete_project(cbm_http_conn_t *c, const cbm_http_req_t *req)
 
     char db_path[1024];
     db_path_for_project(name, db_path, sizeof(db_path));
-
-    if (!cbm_file_exists(db_path)) {
+    if (db_path[0] == '\0') {
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
     }
 
     if (unlink(db_path) != 0) {
+        if (errno == ENOENT) {
+            unwatch_project(srv, name);
+            cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+            return;
+        }
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"failed to delete\"}");
         return;
     }
@@ -1085,6 +1300,7 @@ static void handle_delete_project(cbm_http_conn_t *c, const cbm_http_req_t *req)
     (void)unlink(wal_path);
     (void)unlink(shm_path);
 
+    unwatch_project(srv, name);
     cbm_log_info("ui.project.deleted", "name", name);
     cbm_http_replyf(c, 200, g_cors_json, "{\"deleted\":true}");
 }
@@ -1462,6 +1678,12 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
+    /* GET /api/repo-info → git remote / branch for GitHub deep-links */
+    if (is_get && cbm_http_path_match(req->path, "/api/repo-info*")) {
+        handle_repo_info(c, req);
+        return;
+    }
+
     /* POST /api/index → start background indexing */
     if (is_post && cbm_http_path_match(req->path, "/api/index")) {
         handle_index_start(c, req);
@@ -1482,7 +1704,7 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
     /* DELETE /api/project → delete a project's .db file */
     if (is_delete && cbm_http_path_match(req->path, "/api/project*")) {
-        handle_delete_project(c, req);
+        handle_delete_project(srv, c, req);
         return;
     }
 
@@ -1646,5 +1868,11 @@ int cbm_http_server_port(const cbm_http_server_t *srv) {
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms) {
     if (srv && srv->listener_ok) {
         cbm_httpd_set_recv_deadline_ms(srv->listener, ms);
+    }
+}
+
+void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher) {
+    if (srv) {
+        srv->watcher = watcher;
     }
 }

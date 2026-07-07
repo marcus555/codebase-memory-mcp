@@ -64,6 +64,7 @@ void c_lsp_init(CLSPContext *ctx, CBMArena *arena, const char *source, int sourc
     ctx->source_len = source_len;
     ctx->registry = registry;
     ctx->module_qn = module_qn;
+    ctx->module_qn_len = module_qn ? strlen(module_qn) : 0;
     ctx->cpp_mode = cpp_mode;
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
@@ -2506,6 +2507,105 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
 // c_lookup_member: method/field lookup with base class traversal
 // ============================================================================
 
+// Build "<module_qn>.<type_qn>" into a caller-provided stack buffer, replacing the
+// vsnprintf("%s.%s") path (whose %s does a strlen of both args) that otherwise
+// dominates the kernel cross-file resolve miss cascade. Uses the cached module_qn_len.
+// Returns buf on success, or NULL if the result would not fit (caller falls back to
+// cbm_arena_sprintf). The buffer is only read by the immediate registry lookup — a
+// stack lifetime is sufficient (the QN is never retained).
+static const char *c_build_module_prefixed(const CLSPContext *ctx, const char *type_qn, char *buf,
+                                           size_t bufsz) {
+    size_t mlen = ctx->module_qn_len;
+    size_t tlen = strlen(type_qn);
+    if (mlen + 1 + tlen + 1 > bufsz)
+        return NULL; // would truncate → fall back to arena sprintf
+    memcpy(buf, ctx->module_qn, mlen);
+    buf[mlen] = '.';
+    memcpy(buf + mlen + 1, type_qn, tlen);
+    buf[mlen + 1 + tlen] = '\0';
+    return buf;
+}
+
+// FNV-1a over (type_qn, 0xff separator, member_name) for the negative-lookup memo.
+// 0 is remapped to 1 so it can serve as the empty-slot sentinel.
+static uint64_t c_neg_memo_hash(const char *type_qn, const char *member_name) {
+    uint64_t h = 1469598103934665603ULL; // FNV-1a offset basis
+    for (const unsigned char *p = (const unsigned char *)type_qn; *p; p++) {
+        h ^= (uint64_t)*p;
+        h *= 1099511628211ULL;
+    }
+    h ^= (uint64_t)0xffu;
+    h *= 1099511628211ULL;
+    for (const unsigned char *p = (const unsigned char *)member_name; *p; p++) {
+        h ^= (uint64_t)*p;
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1ULL;
+}
+
+static bool c_neg_memo_contains(const CLSPContext *ctx, uint64_t h) {
+    if (!ctx->neg_memo || ctx->neg_memo_cap == 0)
+        return false;
+    uint64_t mask = (uint64_t)ctx->neg_memo_cap - 1;
+    for (uint64_t i = h & mask;; i = (i + 1) & mask) {
+        uint64_t slot = ctx->neg_memo[i];
+        if (slot == 0)
+            return false; // empty slot → not present
+        if (slot == h)
+            return true;
+    }
+}
+
+static void c_neg_memo_insert(CLSPContext *ctx, uint64_t h) {
+    // Lazy alloc / grow-by-rehash at 70% load. On OOM, silently disable the memo
+    // (correctness is unaffected — the full cascade still runs).
+    if (ctx->neg_memo == NULL) {
+        uint64_t *nm = (uint64_t *)calloc(1024, sizeof(uint64_t));
+        if (!nm)
+            return;
+        ctx->neg_memo = nm;
+        ctx->neg_memo_cap = 1024;
+        ctx->neg_memo_count = 0;
+    } else if ((ctx->neg_memo_count + 1) * 10 >= ctx->neg_memo_cap * 7) {
+        int new_cap = ctx->neg_memo_cap * 2;
+        uint64_t *nm = (uint64_t *)calloc((size_t)new_cap, sizeof(uint64_t));
+        if (nm) {
+            uint64_t nmask = (uint64_t)new_cap - 1;
+            for (int j = 0; j < ctx->neg_memo_cap; j++) {
+                uint64_t v = ctx->neg_memo[j];
+                if (v == 0)
+                    continue;
+                uint64_t k = v & nmask;
+                while (nm[k] != 0)
+                    k = (k + 1) & nmask;
+                nm[k] = v;
+            }
+            free(ctx->neg_memo);
+            ctx->neg_memo = nm;
+            ctx->neg_memo_cap = new_cap;
+        }
+        // if calloc failed: keep the existing table (load may exceed 70%, still correct)
+    }
+    uint64_t mask = (uint64_t)ctx->neg_memo_cap - 1;
+    for (uint64_t i = h & mask;; i = (i + 1) & mask) {
+        if (ctx->neg_memo[i] == 0) {
+            ctx->neg_memo[i] = h;
+            ctx->neg_memo_count++;
+            return;
+        }
+        if (ctx->neg_memo[i] == h)
+            return; // already recorded
+    }
+}
+
+static void c_neg_memo_free(CLSPContext *ctx) {
+    if (ctx->neg_memo)
+        free(ctx->neg_memo);
+    ctx->neg_memo = NULL;
+    ctx->neg_memo_cap = 0;
+    ctx->neg_memo_count = 0;
+}
+
 static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const char *type_qn,
                                                       const char *member_name, int depth) {
     if (!type_qn || !member_name)
@@ -2513,21 +2613,42 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
     if (depth > CBM_LSP_MAX_LOOKUP_DEPTH)
         return NULL;
 
-    // Direct method lookup
+    // Direct method lookup. Runs FIRST, before consulting the memo, so a real
+    // direct-resolvable member (incl. a hash-collision victim, or one registered
+    // mid-file) can never be skipped: it is returned here regardless of the memo.
     const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, type_qn, member_name);
     if (f)
         return f;
 
-    // Try module-prefixed QN (e.g., "Container" -> "test.main.Container")
-    if (ctx->module_qn) {
-        const char *prefixed = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn);
+    // Negative-lookup memo (depth==0, shared read-only registry only). A recorded
+    // hit means this exact (type_qn, member) already failed the whole cascade. Under
+    // the sealed Tier-2 registry the module-prefix (below), base-class and short-name
+    // cascades are pure, immutable functions of (type_qn, registry), so they are
+    // provably still NULL and can be skipped. Only the SCOPE-ALIAS path is
+    // context-dependent, so it is still evaluated below before we trust the memo.
+    // The direct lookup above already served as the collision/staleness verification.
+    bool neg_memo_hit = false;
+    uint64_t neg_h = 0;
+    if (depth == 0 && ctx->registry_shared) {
+        neg_h = c_neg_memo_hash(type_qn, member_name);
+        neg_memo_hit = c_neg_memo_contains(ctx, neg_h);
+    }
+
+    // Try module-prefixed QN (e.g., "Container" -> "test.main.Container").
+    // Skipped on a memo hit: provably NULL under the read-only shared registry.
+    if (!neg_memo_hit && ctx->module_qn) {
+        char sbuf[1024];
+        const char *prefixed = c_build_module_prefixed(ctx, type_qn, sbuf, sizeof(sbuf));
+        if (!prefixed)
+            prefixed = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn);
         f = cbm_registry_lookup_method(ctx->registry, prefixed, member_name);
         if (f)
             return f;
     }
 
     // Scope-based alias: using Vec = std::vector<T>;
-    // Vec is in scope as ALIAS → follow to underlying type's QN
+    // Vec is in scope as ALIAS → follow to underlying type's QN.
+    // ALWAYS evaluated (scope is context-dependent — not covered by the memo).
     {
         const CBMType *scoped = cbm_scope_lookup(ctx->current_scope, type_qn);
         if (scoped && scoped->kind == CBM_TYPE_ALIAS) {
@@ -2543,11 +2664,21 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
         }
     }
 
+    // Memo hit and the scope-alias path also missed: the remaining base-class and
+    // short-name cascades are registry-only and provably NULL → skip them (this is
+    // where the O(type_count) short-name scan is avoided). Idempotent re-insert is
+    // unnecessary since neg_h is already present.
+    if (neg_memo_hit)
+        return NULL;
+
     // Check registered type for alias and base classes
     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
     if (!rt && ctx->module_qn) {
-        rt = cbm_registry_lookup_type(
-            ctx->registry, cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn));
+        char sbuf[1024];
+        const char *prefixed = c_build_module_prefixed(ctx, type_qn, sbuf, sizeof(sbuf));
+        if (!prefixed)
+            prefixed = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn);
+        rt = cbm_registry_lookup_type(ctx->registry, prefixed);
     }
     if (rt) {
         // Alias chain
@@ -2606,6 +2737,10 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
         }
     }
 
+    // Whole cascade missed: record the negative result so a repeat of this exact
+    // (type_qn, member) can skip the module-prefix/base-class/short-name work.
+    if (depth == 0 && ctx->registry_shared)
+        c_neg_memo_insert(ctx, neg_h);
     return NULL;
 }
 
@@ -4845,6 +4980,10 @@ __attribute__((no_sanitize("address"))) void c_lsp_process_file(CLSPContext *ctx
         child = kids[i];
         c_process_body_child(ctx, child);
     }
+
+    // Release the per-file negative-lookup memo (malloc-owned; only allocated in
+    // shared-registry mode). No-op when it was never populated.
+    c_neg_memo_free(ctx);
 }
 
 // ============================================================================

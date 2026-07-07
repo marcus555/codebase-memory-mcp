@@ -12,6 +12,15 @@
 # Linux: gcc/g++ — system default with full sanitizer support
 # CI scripts pass CC/CXX explicitly; don't rely on defaults here
 
+# Target architecture (macOS): build.sh/test.sh export ARCHFLAGS="-arch <arch>"
+# (see scripts/env.sh). Fold it into the compiler drivers with `override` so it
+# reaches EVERY compile and link recipe — including the vendored objects below
+# that use their own *_CFLAGS — and so it survives a command-line `CC=` override.
+# ARCHFLAGS is empty on Linux/Windows and for native direct `make` invocations,
+# leaving CC/CXX unchanged there.
+override CC := $(CC) $(ARCHFLAGS)
+override CXX := $(CXX) $(ARCHFLAGS)
+
 # ── Common flags ─────────────────────────────────────────────────
 
 # Include paths for:
@@ -24,17 +33,6 @@ TS_INCLUDE = $(CBM_DIR)/vendored/ts_runtime/include
 # Vendored tree-sitter src/ contains unicode/ headers (umachine.h, utf.h, utf8.h).
 # This ensures we use our vendored copies instead of requiring system libicu-dev.
 TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
-
-# ── Optional libgit2 (faster git history parsing) ────────────────
-# Auto-detected via pkg-config. Falls back to popen("git log ...") if absent.
-LIBGIT2_CFLAGS := $(shell pkg-config --cflags libgit2 2>/dev/null)
-LIBGIT2_LIBS := $(shell pkg-config --libs libgit2 2>/dev/null)
-ifneq ($(LIBGIT2_LIBS),)
-LIBGIT2_FLAGS = -DHAVE_LIBGIT2 $(LIBGIT2_CFLAGS)
-else
-LIBGIT2_FLAGS =
-LIBGIT2_LIBS =
-endif
 
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
 # Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
@@ -50,8 +48,7 @@ CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 $(GCC_ONLY_FLAGS) \
                 -Isrc -Ivendored -Ivendored/sqlite3 \
                 -Ivendored/mimalloc/include \
-                -I$(CBM_DIR) -I$(TS_INCLUDE) \
-                $(LIBGIT2_FLAGS)
+                -I$(CBM_DIR) -I$(TS_INCLUDE)
 
 CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
@@ -75,13 +72,14 @@ CFLAGS_TSAN = $(CFLAGS_COMMON) -g -O1 \
 CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
                 -fsanitize=thread -fno-omit-frame-pointer
 
-# Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), and
+# Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
+# (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), and
 # --allow-multiple-definition (MinGW CRT symbol clashes).
 # Auto-detected via compiler; no manual override needed.
 IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
 WIN32_LIBS :=
 ifeq ($(IS_MINGW),yes)
-WIN32_LIBS := -lws2_32 -lpsapi -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
+WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -89,9 +87,9 @@ ifeq ($(STATIC),1)
 STATIC_FLAGS := -static
 endif
 
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS)
-LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
-LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(LIBGIT2_LIBS) $(WIN32_LIBS)
+LDFLAGS = -lm -lstdc++ -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS)
+LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(WIN32_LIBS)
+LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(WIN32_LIBS)
 
 # ── Source files ─────────────────────────────────────────────────
 
@@ -113,7 +111,8 @@ FOUNDATION_SRCS = \
     src/foundation/diagnostics.c \
     src/foundation/profile.c \
     src/foundation/dump_verify.c \
-    src/foundation/limits.c
+    src/foundation/limits.c \
+    src/foundation/subprocess.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -173,7 +172,7 @@ STORE_SRCS = src/store/store.c
 CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
-MCP_SRCS = src/mcp/mcp.c
+MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c
 
 # Discover module (new)
 DISCOVER_SRCS = \
@@ -221,7 +220,7 @@ PIPELINE_SRCS = \
 SIMHASH_SRCS = src/simhash/minhash.c
 
 # Semantic embedding module
-SEMANTIC_SRCS = src/semantic/semantic.c src/semantic/ast_profile.c
+SEMANTIC_SRCS = src/semantic/semantic.c src/semantic/ast_profile.c src/semantic/rotsq.c
 
 # nomic-embed-code pretrained vectors (assembler blob)
 UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
@@ -310,7 +309,8 @@ TEST_FOUNDATION_SRCS = \
     tests/test_log.c \
     tests/test_str_util.c \
     tests/test_platform.c \
-    tests/test_dump_verify.c
+    tests/test_dump_verify.c \
+    tests/test_subprocess.c
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
@@ -399,6 +399,10 @@ TEST_SECURITY_SRCS = tests/test_security.c
 
 TEST_YAML_SRCS = tests/test_yaml.c
 
+TEST_SEMANTIC_SRCS = tests/test_semantic.c
+TEST_AST_PROFILE_SRCS = tests/test_ast_profile.c
+TEST_SLAB_ALLOC_SRCS = tests/test_slab_alloc.c
+
 TEST_SIMHASH_SRCS = tests/test_simhash.c
 
 TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
@@ -408,6 +412,7 @@ TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
 # Kept out of the gating `make test` so `ci-ok` stays green; run via `make test-repro`.
 TEST_REPRO_SRCS = \
     tests/repro/repro_main.c \
+    tests/repro/repro_parallel_determinism.c \
     tests/repro/repro_extraction.c \
     tests/repro/repro_issue495.c \
     tests/repro/repro_issue521.c \
@@ -438,6 +443,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_new_cypher_limit_zero.c \
     tests/repro/repro_issue363.c \
     tests/repro/repro_issue581.c \
+    tests/repro/repro_issue787.c \
     tests/repro/repro_invariant_calls.c \
     tests/repro/repro_invariant_graph.c \
     tests/repro/repro_invariant_breadth.c \
@@ -458,10 +464,11 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_c_cpp.c \
     tests/repro/repro_lsp_go_py.c \
     tests/repro/repro_lsp_ts.c \
+    tests/repro/repro_ts_inherited_method.c \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────

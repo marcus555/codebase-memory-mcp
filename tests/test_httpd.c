@@ -16,11 +16,14 @@
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h"
 #include "../src/cli/cli.h"
+#include "../src/git/git_context.h" /* #798 follow-up: live-socket git-resolve repro */
 #include "../src/ui/http_server.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "ui/httpd.h"
 #include "ui/http_server.h"
+#include <store/store.h>
+#include <watcher/watcher.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +35,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h> /* #798 follow-up: CreateThread/WaitForSingleObject watchdog */
 typedef SOCKET th_sock_t;
 #define th_sock_close closesocket
 #define TH_SOCK_BAD INVALID_SOCKET
@@ -39,6 +43,7 @@ typedef SOCKET th_sock_t;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h> /* struct timeval for the SO_RCVTIMEO watchdog (#798 follow-up) */
 #include <unistd.h>
 typedef int th_sock_t;
 #define th_sock_close close
@@ -413,10 +418,92 @@ static int th_server_start(th_server_t *ts) {
     return 0;
 }
 
+static int th_server_start_with_watcher(th_server_t *ts, cbm_watcher_t *watcher) {
+    ts->srv = cbm_http_server_new(0);
+    if (!ts->srv)
+        return -1;
+    cbm_http_server_set_watcher(ts->srv, watcher);
+    if (cbm_thread_create(&ts->tid, 0, th_server_thread, ts->srv) != 0) {
+        cbm_http_server_free(ts->srv);
+        return -1;
+    }
+    return 0;
+}
+
 static void th_server_stop(th_server_t *ts) {
     cbm_http_server_stop(ts->srv);
     cbm_thread_join(&ts->tid);
     cbm_http_server_free(ts->srv);
+}
+
+typedef struct {
+    char tmpdir[256];
+    char cache_dir[512];
+    char root_dir[512];
+    char *saved_cache_dir;
+    cbm_store_t *store;
+    cbm_watcher_t *watcher;
+} ui_delete_fixture_t;
+
+static int ui_delete_fixture_init(ui_delete_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    char *tmp = th_mktempdir("cbm_httpd_delete");
+    if (!tmp)
+        return -1;
+    snprintf(fx->tmpdir, sizeof(fx->tmpdir), "%s", tmp);
+    snprintf(fx->cache_dir, sizeof(fx->cache_dir), "%s/cache", fx->tmpdir);
+    snprintf(fx->root_dir, sizeof(fx->root_dir), "%s/root", fx->tmpdir);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    fx->saved_cache_dir = saved ? strdup(saved) : NULL;
+    if (th_mkdir_p(fx->cache_dir) != 0 || th_mkdir_p(fx->root_dir) != 0) {
+        return -1;
+    }
+    cbm_setenv("CBM_CACHE_DIR", fx->cache_dir, 1);
+
+    fx->store = cbm_store_open_memory();
+    fx->watcher = cbm_watcher_new(fx->store, NULL, NULL);
+    return fx->store && fx->watcher ? 0 : -1;
+}
+
+static void ui_delete_fixture_cleanup(ui_delete_fixture_t *fx) {
+    if (fx->watcher)
+        cbm_watcher_free(fx->watcher);
+    if (fx->store)
+        cbm_store_close(fx->store);
+    if (fx->saved_cache_dir) {
+        cbm_setenv("CBM_CACHE_DIR", fx->saved_cache_dir, 1);
+        free(fx->saved_cache_dir);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_cleanup(fx->tmpdir);
+}
+
+static void ui_delete_db_path(const ui_delete_fixture_t *fx, const char *project, char *out,
+                              size_t outsz) {
+    snprintf(out, outsz, "%s/%s.db", fx->cache_dir, project);
+}
+
+static int ui_delete_make_db_file(const ui_delete_fixture_t *fx, const char *project) {
+    char path[1024];
+    ui_delete_db_path(fx, project, path, sizeof(path));
+    return th_write_file(path, "test db");
+}
+
+static int ui_delete_make_sidecars(const ui_delete_fixture_t *fx, const char *project) {
+    char path[1024];
+    ui_delete_db_path(fx, project, path, sizeof(path));
+    char wal[1040], shm[1040];
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    snprintf(shm, sizeof(shm), "%s-shm", path);
+    return th_write_file(wal, "wal") == 0 && th_write_file(shm, "shm") == 0 ? 0 : -1;
+}
+
+static int ui_delete_request(th_server_t *ts, const char *target, char *resp, size_t respsz) {
+    char req[512];
+    snprintf(req, sizeof(req), "DELETE %s HTTP/1.1\r\n\r\n", target);
+    return th_http(cbm_http_server_port(ts->srv), req, resp, respsz);
 }
 
 TEST(ui_server_unknown_path_404) {
@@ -562,6 +649,141 @@ TEST(ui_server_browse_traversal_probe) {
     PASS();
 }
 
+TEST(ui_server_delete_project_unwatches_after_delete) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    ASSERT_EQ(ui_delete_make_db_file(&fx, "ui-delete-watch"), 0);
+    ASSERT_EQ(ui_delete_make_sidecars(&fx, "ui-delete-watch"), 0);
+    cbm_watcher_watch(fx.watcher, "ui-delete-watch", fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    char resp[4096];
+    int n = ui_delete_request(&ts, "/api/project?name=ui-delete-watch", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "{\"deleted\":true}"));
+
+    char db[1024], wal[1040], shm[1040];
+    ui_delete_db_path(&fx, "ui-delete-watch", db, sizeof(db));
+    snprintf(wal, sizeof(wal), "%s-wal", db);
+    snprintf(shm, sizeof(shm), "%s-shm", db);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_FALSE(cbm_file_exists(wal));
+    ASSERT_FALSE(cbm_file_exists(shm));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 0);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_project_unwatches_missing_db) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    cbm_watcher_watch(fx.watcher, "ui-delete-missing", fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    char resp[4096];
+    int n = ui_delete_request(&ts, "/api/project?name=ui-delete-missing", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 404);
+    ASSERT_NOT_NULL(strstr(resp, "{\"error\":\"project not found\"}"));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 0);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_project_no_watcher_still_deletes) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    ASSERT_EQ(ui_delete_make_db_file(&fx, "ui-delete-no-watcher"), 0);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[4096];
+    int n = ui_delete_request(&ts, "/api/project?name=ui-delete-no-watcher", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+
+    char db[1024];
+    ui_delete_db_path(&fx, "ui-delete-no-watcher", db, sizeof(db));
+    ASSERT_FALSE(cbm_file_exists(db));
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_project_missing_name_keeps_watch) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    cbm_watcher_watch(fx.watcher, "ui-delete-still-watched", fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    char resp[4096];
+    int n = ui_delete_request(&ts, "/api/project", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 400);
+    ASSERT_NOT_NULL(strstr(resp, "{\"error\":\"missing name\"}"));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_project_invalid_name_keeps_watch) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    cbm_watcher_watch(fx.watcher, "bad/name", fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    char resp[4096];
+    int n = ui_delete_request(&ts, "/api/project?name=bad%2Fname", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 404);
+    ASSERT_NOT_NULL(strstr(resp, "{\"error\":\"project not found\"}"));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_project_unlink_failure_keeps_watch) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    char db[1024];
+    ui_delete_db_path(&fx, "ui-delete-unlink-fails", db, sizeof(db));
+    ASSERT_EQ(th_mkdir_p(db), 0);
+    cbm_watcher_watch(fx.watcher, "ui-delete-unlink-fails", fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    char resp[4096];
+    int n = ui_delete_request(&ts, "/api/project?name=ui-delete-unlink-fails", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 500);
+    ASSERT_NOT_NULL(strstr(resp, "{\"error\":\"failed to delete\"}"));
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
 TEST(ui_server_ui_config_detects_zh_accept_language) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -682,6 +904,187 @@ TEST(ui_server_stop_joins_cleanly) {
     PASS();
 }
 
+/* ── /api/repo-info git-remote URL helpers (distilled from PR #789) ── */
+
+/* The web base must always be https (deep-links can't be downgraded) and must
+ * never carry embedded credentials, across scp / ssh / https remote shapes. */
+TEST(repo_info_web_base_normalizes_to_https) {
+    struct {
+        const char *in;
+        const char *want;
+    } cases[] = {
+        {"git@github.com:org/repo.git", "https://github.com/org/repo"},
+        {"git@github.com:org/repo", "https://github.com/org/repo"},
+        {"https://github.com/org/repo.git", "https://github.com/org/repo"},
+        {"ssh://git@github.com/org/repo.git", "https://github.com/org/repo"},
+        {"https://user:token@github.com/org/repo.git", "https://github.com/org/repo"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *got = cbm_ui_git_web_base(cases[i].in);
+        ASSERT_NOT_NULL(got);
+        ASSERT_STR_EQ(got, cases[i].want);
+        /* Never leak credentials into the web base. */
+        ASSERT_NULL(strstr(got, "token"));
+        ASSERT_NULL(strstr(got, "@"));
+        free(got);
+    }
+    /* Unrecognized shapes yield NULL, not a bogus link. */
+    ASSERT_NULL(cbm_ui_git_web_base(""));
+    ASSERT_NULL(cbm_ui_git_web_base("not-a-url"));
+    PASS();
+}
+
+/* The remote_url field echoed to the client must have any user:pass@ stripped. */
+TEST(repo_info_strips_credentials_from_remote) {
+    char *safe = cbm_ui_git_strip_credentials("https://alice:s3cr3t@github.com/org/repo.git");
+    ASSERT_NOT_NULL(safe);
+    ASSERT_STR_EQ(safe, "https://github.com/org/repo.git");
+    ASSERT_NULL(strstr(safe, "s3cr3t"));
+    ASSERT_NULL(strstr(safe, "alice"));
+    free(safe);
+
+    /* Credential-free URLs pass through unchanged. */
+    char *plain = cbm_ui_git_strip_credentials("https://github.com/org/repo.git");
+    ASSERT_NOT_NULL(plain);
+    ASSERT_STR_EQ(plain, "https://github.com/org/repo.git");
+    free(plain);
+
+    /* An '@' in the path (not the authority) must not be treated as creds. */
+    char *pathat = cbm_ui_git_strip_credentials("https://github.com/org/repo/@scope");
+    ASSERT_NOT_NULL(pathat);
+    ASSERT_STR_EQ(pathat, "https://github.com/org/repo/@scope");
+    free(pathat);
+
+    /* scp-style carries no secret and is left intact. */
+    char *scp = cbm_ui_git_strip_credentials("git@github.com:org/repo.git");
+    ASSERT_NOT_NULL(scp);
+    ASSERT_STR_EQ(scp, "git@github.com:org/repo.git");
+    free(scp);
+
+    ASSERT_NULL(cbm_ui_git_strip_credentials(NULL));
+    PASS();
+}
+
+/* ── #798 follow-up: full UI-mode hang repro (live sockets) ───── */
+
+/* Like th_http but arms a client-side receive-timeout watchdog. If the
+ * single-threaded server wedges, recv() returns instead of blocking forever, so
+ * the test FAILs deterministically rather than hanging CI. 0 on connect/timeout. */
+static int th_http_deadline(int port, const char *request, char *resp, size_t respsz,
+                            int timeout_ms) {
+    th_sock_t s = th_connect(port);
+    if (s == TH_SOCK_BAD)
+        return 0;
+#ifdef _WIN32
+    DWORD tv = (DWORD)timeout_ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+    if (th_send_all(s, request, strlen(request)) != 0) {
+        th_sock_close(s);
+        return 0;
+    }
+    int n = th_recv_until_close(s, resp, respsz);
+    th_sock_close(s);
+    return n;
+}
+
+/* #798 was a single-threaded-server wedge: list_projects never returned and the
+ * whole UI stopped answering. Assert the running server answers list_projects
+ * within a hard deadline while it holds live listening sockets. The client
+ * receive-timeout is the watchdog: a wedge → no 200 → FAIL, never a CI hang. */
+TEST(ui_server_list_projects_responds_under_watchdog) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                       "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}";
+    char req[512];
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %d\r\n\r\n%s",
+             (int)strlen(body), body);
+    char resp[8192];
+    int n = th_http_deadline(cbm_http_server_port(ts.srv), req, resp, sizeof(resp), 15000);
+    th_server_stop(&ts);
+    ASSERT_GT(n, 0); /* a response arrived before the watchdog fired */
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+    PASS();
+}
+
+#ifdef _WIN32
+typedef struct {
+    char path[512];
+    int resolved_ok;
+} th_gitctx_probe_t;
+
+static DWORD WINAPI th_gitctx_probe_thread(LPVOID arg) {
+    th_gitctx_probe_t *p = (th_gitctx_probe_t *)arg;
+    cbm_git_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    int rc = cbm_git_context_resolve(p->path, &ctx);
+    p->resolved_ok = (rc == 0 && ctx.is_git) ? 1 : 0;
+    cbm_git_context_free(&ctx);
+    return 0;
+}
+#endif
+
+/* The load-bearing end-to-end repro of #798: while the single-threaded UI server
+ * holds LIVE listening/AFD socket handles in this process, cbm_git_context_resolve
+ * — the exact path list_projects runs (add_git_context_json → resolve →
+ * cbm_popen(git)) — must not hang. Under a raw-_popen regression git inherits
+ * those sockets and its MSYS2 runtime deadlocks in NtQueryObject; the watchdog
+ * turns that into a hard FAIL instead of an infinite hang. */
+TEST(git_context_resolve_no_hang_under_live_ui_sockets) {
+#ifndef _WIN32
+    SKIP_PLATFORM("Windows-only: #798 UI listening-socket handle inheritance");
+#else
+    char *tmp = th_mktempdir("cbm_798repro");
+    if (!tmp)
+        FAIL("th_mktempdir returned NULL");
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" init -q && git -C \"%s\" -c user.email=t@t -c user.name=t "
+             "commit -q --allow-empty -m init",
+             tmp, tmp);
+    if (system(cmd) != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+
+    th_gitctx_probe_t *probe = (th_gitctx_probe_t *)calloc(1, sizeof(*probe));
+    ASSERT_NOT_NULL(probe);
+    snprintf(probe->path, sizeof(probe->path), "%s", tmp);
+
+    HANDLE h = CreateThread(NULL, 0, th_gitctx_probe_thread, probe, 0, NULL);
+    ASSERT_NOT_NULL(h);
+    DWORD w = WaitForSingleObject(h, 30000);
+    if (w != WAIT_OBJECT_0) {
+        /* Wedged on the inherited-socket NtQueryObject walk. Deliberately leak
+         * the heap probe + thread (a late wake must not touch freed memory);
+         * process exit reaps them. Fail loudly rather than hang CI. */
+        th_server_stop(&ts);
+        FAIL("cbm_git_context_resolve hung under live UI sockets (#798 regression)");
+    }
+    CloseHandle(h);
+    th_server_stop(&ts);
+    int ok = probe->resolved_ok;
+    free(probe);
+    th_rmtree(tmp);
+    ASSERT_EQ(ok, 1);
+    PASS();
+#endif
+}
+
 /* ── Suite ────────────────────────────────────────────────────── */
 
 SUITE(httpd) {
@@ -702,6 +1105,8 @@ SUITE(httpd) {
     RUN_TEST(httpd_query_param_edge_cases);
     RUN_TEST(httpd_path_match_matrix);
     RUN_TEST(httpd_resolves_bare_binary_path_from_path);
+    RUN_TEST(repo_info_web_base_normalizes_to_https);
+    RUN_TEST(repo_info_strips_credentials_from_remote);
 
     /* Transport */
     RUN_TEST(httpd_listen_ephemeral_port);
@@ -717,9 +1122,18 @@ SUITE(httpd) {
     RUN_TEST(ui_server_encoded_slash_not_routed);
     RUN_TEST(ui_server_nul_in_target_rejected);
     RUN_TEST(ui_server_browse_traversal_probe);
+    RUN_TEST(ui_server_delete_project_unwatches_after_delete);
+    RUN_TEST(ui_server_delete_project_unwatches_missing_db);
+    RUN_TEST(ui_server_delete_project_no_watcher_still_deletes);
+    RUN_TEST(ui_server_delete_project_missing_name_keeps_watch);
+    RUN_TEST(ui_server_delete_project_invalid_name_keeps_watch);
+    RUN_TEST(ui_server_delete_project_unlink_failure_keeps_watch);
     RUN_TEST(ui_server_ui_config_detects_zh_accept_language);
     RUN_TEST(ui_server_ui_config_prefers_config_lang);
     RUN_TEST(ui_server_slow_request_hits_deadline);
     RUN_TEST(ui_server_access_log_redacts_query);
     RUN_TEST(ui_server_stop_joins_cleanly);
+    /* #798 follow-up: full UI-mode hang repro under live sockets */
+    RUN_TEST(ui_server_list_projects_responds_under_watchdog);
+    RUN_TEST(git_context_resolve_no_hang_under_live_ui_sockets);
 }

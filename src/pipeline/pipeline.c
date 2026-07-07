@@ -331,6 +331,19 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
     }
 }
 
+/* Effective worker count. The crash supervisor re-runs its worker single-
+ * threaded (CBM_INDEX_SINGLE_THREAD=1) so a per-file marker can pin the EXACT
+ * crasher; a parallel re-run would race the marker. Honour that override
+ * everywhere the worker count drives the parallel/sequential decision, so the
+ * whole extraction phase collapses to the deterministic sequential path. */
+static int effective_worker_count(bool initial) {
+    const char *st = getenv("CBM_INDEX_SINGLE_THREAD");
+    if (st && st[0] == '1') {
+        return 1;
+    }
+    return cbm_default_worker_count(initial);
+}
+
 /* Resolve the DB path for this pipeline. Caller must free(). */
 static char *resolve_db_path(const cbm_pipeline_t *p) {
     char *path = malloc(CBM_SZ_1K);
@@ -737,8 +750,9 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * Use the repo-walking variant so manifests filtered out by the main
      * discoverer (package.json, composer.json) still feed pkgmap and let
      * workspace imports like `@my/pkg` resolve to their target Module. */
-    cbm_pipeline_set_pkgmap(
-        cbm_pkgmap_build_from_repo(ctx->repo_path, files, file_count, ctx->project_name));
+    cbm_pipeline_set_pkgmap(cbm_pkgmap_build_from_repo(ctx->repo_path, files, file_count,
+                                                       ctx->project_name, ctx->excluded_dirs,
+                                                       ctx->excluded_count));
 
     CBMFileResult **seq_cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (seq_cache) {
@@ -889,6 +903,9 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cross_registries.c = cbm_c_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        /* Rust: NOT built here. The shared all_defs registry is built LAZILY on the
+         * first NULL-filter rust file (the amplifier files) inside cbm_parallel_resolve
+         * — repos whose rust files all filter to subsets never pay the build/RSS. */
     }
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
@@ -1032,30 +1049,71 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         return rc;
     }
     cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
+    /* Persist-tail spans (phase "persist"): attribute the ~60s that lands here
+     * AFTER cbm_gbuf_dump_to_sqlite returns. Active only under CBM_PROFILE. */
+    CBM_PROF_START(t_reopen);
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
+    CBM_PROF_END("persist", "1_reopen", t_reopen);
     if (hash_store) {
+        CBM_PROF_START(t_delhash);
         cbm_store_delete_file_hashes(hash_store, p->project_name);
+        CBM_PROF_END("persist", "2_delete_file_hashes", t_delhash);
 
         /* Restore the ADR captured before the dump. Surface a failed restore
          * rather than silently dropping the ADR (the original #516 symptom). */
+        CBM_PROF_START(t_adr);
         if (p->saved_adr) {
             if (cbm_store_adr_store(hash_store, p->project_name, p->saved_adr) != CBM_STORE_OK) {
                 cbm_log_error("pipeline.err", "phase", "adr_restore", "project", p->project_name);
             }
         }
-        for (int i = 0; i < file_count; i++) {
-            struct stat fst;
-            if (stat(files[i].path, &fst) == 0) {
-                cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path, "",
-                                           stat_mtime_ns(&fst), fst.st_size);
+        CBM_PROF_END("persist", "3_adr_restore", t_adr);
+
+        /* Batch the per-file hash upserts into ONE transaction. The per-file
+         * cbm_store_upsert_file_hash path autocommits, i.e. file_count fsyncs
+         * (~89k on the kernel); cbm_store_upsert_file_hash_batch wraps the same
+         * cached INSERT ... ON CONFLICT upsert in a single begin/commit. Same
+         * (project, rel_path, sha256="", mtime_ns, size) tuples, same replace
+         * semantics — only the transaction boundary changes. */
+        CBM_PROF_START(t_fh);
+        cbm_file_hash_t *fhashes = (cbm_file_hash_t *)malloc(
+            (size_t)(file_count > 0 ? file_count : 1) * sizeof(cbm_file_hash_t));
+        if (fhashes) {
+            int fh_n = 0;
+            for (int i = 0; i < file_count; i++) {
+                struct stat fst;
+                if (stat(files[i].path, &fst) == 0) {
+                    fhashes[fh_n].project = p->project_name;
+                    fhashes[fh_n].rel_path = files[i].rel_path;
+                    fhashes[fh_n].sha256 = "";
+                    fhashes[fh_n].mtime_ns = stat_mtime_ns(&fst);
+                    fhashes[fh_n].size = fst.st_size;
+                    fh_n++;
+                }
+            }
+            if (cbm_store_upsert_file_hash_batch(hash_store, fhashes, fh_n) != CBM_STORE_OK) {
+                cbm_log_error("pipeline.err", "phase", "persist_file_hashes", "project",
+                              p->project_name);
+            }
+            free(fhashes);
+        } else {
+            /* OOM fallback: the original per-file path (identical result, slower). */
+            for (int i = 0; i < file_count; i++) {
+                struct stat fst;
+                if (stat(files[i].path, &fst) == 0) {
+                    cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path, "",
+                                               stat_mtime_ns(&fst), fst.st_size);
+                }
             }
         }
+        CBM_PROF_END_N("persist", "4_file_hashes", t_fh, file_count);
 
         /* FTS5 backfill: populate nodes_fts with camelCase-split names.
          * Contentless FTS5 requires the special 'delete-all' command instead of
          * DELETE FROM to wipe prior rows (there's no underlying content table).
          * Falls back to plain names if cbm_camel_split is unavailable (which
          * shouldn't happen because we always register it, but we stay defensive). */
+        CBM_PROF_START(t_fts);
         cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
         if (cbm_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
@@ -1065,6 +1123,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
                            "SELECT id, name, qualified_name, label, file_path FROM nodes;");
         }
+        CBM_PROF_END("persist", "5_fts_backfill", t_fts);
 
         cbm_store_close(hash_store);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
@@ -1074,7 +1133,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
 
     /* Export persistent artifact if enabled */
     if (p->persistence) {
+        CBM_PROF_START(t_art);
         int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
+        CBM_PROF_END("persist", "6_artifact_export", t_art);
         if (arc != 0) {
             const char *err = cbm_artifact_export_last_error();
             cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
@@ -1097,7 +1158,7 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
 
     if (p->mode != CBM_MODE_FAST) {
-        if (cbm_default_worker_count(true) > SKIP_ONE) {
+        if (effective_worker_count(true) > SKIP_ONE) {
             if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
                 gh_threaded = true;
             }
@@ -1186,7 +1247,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
 
-    int worker_count = cbm_default_worker_count(true);
+    int worker_count = effective_worker_count(true);
     CBM_PROF_START(t_extract_total);
     int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
                  ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
@@ -1261,7 +1322,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* Phase 2b: Load build-tool path aliases (tsconfig/jsconfig today). NULL
      * when no usable configs are found — non-TS projects pay nothing. */
-    path_aliases = cbm_load_path_aliases(p->repo_path);
+    path_aliases =
+        cbm_load_path_aliases_excluded(p->repo_path, p->excluded_dirs, p->excluded_count);
 
     /* Build shared context for pass functions */
     cbm_pipeline_ctx_t ctx = {
@@ -1273,6 +1335,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = (int)p->mode,
         .path_aliases = path_aliases,
+        .excluded_dirs = p->excluded_dirs,
+        .excluded_count = p->excluded_count,
     };
 
     rc = run_extraction_phase(p, &ctx, files, file_count);

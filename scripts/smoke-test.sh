@@ -12,11 +12,12 @@ set -euo pipefail
 BINARY="${1:?usage: smoke-test.sh <binary-path>}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 TMPDIR=$(mktemp -d)
+DRYRUN_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
 if command -v cygpath &>/dev/null; then
     TMPDIR=$(cygpath -m "$TMPDIR")
 fi
-trap 'rm -rf "$TMPDIR"' EXIT
+trap 'rm -rf "$TMPDIR" "${DRYRUN_HOME:-}"' EXIT
 
 CLI_STDERR=$(mktemp)
 cli() { "$BINARY" cli "$@" 2>"$CLI_STDERR"; }
@@ -679,9 +680,27 @@ rm -f "$MCP_CL_INPUT" "$MCP_CL_OUTPUT" "$MCP_TOOL_INPUT" "$MCP_TOOL_OUTPUT"
 echo ""
 echo "=== Phase 6: CLI subcommands ==="
 
+DRYRUN_HOME=$(mktemp -d)
+DRYRUN_CACHE="$DRYRUN_HOME/.cache/codebase-memory-mcp"
+mkdir -p "$DRYRUN_CACHE" \
+  "$DRYRUN_HOME/.local/bin" \
+  "$DRYRUN_HOME/.config" \
+  "$DRYRUN_HOME/AppData/Roaming" \
+  "$DRYRUN_HOME/AppData/Local"
+
+run_dryrun_env() {
+  HOME="$DRYRUN_HOME" \
+    XDG_CONFIG_HOME="$DRYRUN_HOME/.config" \
+    APPDATA="$DRYRUN_HOME/AppData/Roaming" \
+    LOCALAPPDATA="$DRYRUN_HOME/AppData/Local" \
+    CBM_CACHE_DIR="$DRYRUN_CACHE" \
+    PATH="$DRYRUN_HOME/.local/bin:$PATH" \
+    "$@"
+}
+
 # 6a: install --dry-run -y
 echo "--- Phase 6a: install --dry-run ---"
-INSTALL_OUT=$("$BINARY" install --dry-run -y 2>&1)
+INSTALL_OUT=$(run_dryrun_env "$BINARY" install --dry-run -y 2>&1)
 if ! echo "$INSTALL_OUT" | grep -qi 'install\|skill\|mcp\|agent'; then
   echo "FAIL: install --dry-run produced unexpected output"
   echo "$INSTALL_OUT"
@@ -695,7 +714,7 @@ echo "OK: install --dry-run completed"
 
 # 6b: uninstall --dry-run -y
 echo "--- Phase 6b: uninstall --dry-run ---"
-UNINSTALL_OUT=$("$BINARY" uninstall --dry-run -y 2>&1)
+UNINSTALL_OUT=$(run_dryrun_env "$BINARY" uninstall --dry-run -y 2>&1)
 if ! echo "$UNINSTALL_OUT" | grep -qi 'uninstall\|remov'; then
   echo "FAIL: uninstall --dry-run produced unexpected output"
   echo "$UNINSTALL_OUT"
@@ -705,7 +724,7 @@ echo "OK: uninstall --dry-run completed"
 
 # 6c: update --dry-run --standard -y
 echo "--- Phase 6c: update --dry-run ---"
-UPDATE_OUT=$("$BINARY" update --dry-run --standard -y 2>&1)
+UPDATE_OUT=$(run_dryrun_env "$BINARY" update --dry-run --standard -y 2>&1)
 if ! echo "$UPDATE_OUT" | grep -qi 'dry-run'; then
   echo "FAIL: update --dry-run did not indicate dry-run mode"
   echo "$UPDATE_OUT"
@@ -730,13 +749,13 @@ echo "OK: update --dry-run --standard completed"
 
 # 6d: config set/get/reset round-trip
 echo "--- Phase 6d: config set/get/reset ---"
-"$BINARY" config set auto_index true 2>/dev/null
-CONFIG_VAL=$("$BINARY" config get auto_index 2>/dev/null)
+run_dryrun_env "$BINARY" config set auto_index true 2>/dev/null
+CONFIG_VAL=$(run_dryrun_env "$BINARY" config get auto_index 2>/dev/null)
 if ! echo "$CONFIG_VAL" | grep -q 'true'; then
   echo "FAIL: config get auto_index returned '$CONFIG_VAL', expected 'true'"
   exit 1
 fi
-"$BINARY" config reset auto_index 2>/dev/null
+run_dryrun_env "$BINARY" config reset auto_index 2>/dev/null
 echo "OK: config set/get/reset round-trip"
 
 # 6e: Simulated binary replacement (update flow without network)
@@ -1551,18 +1570,26 @@ DL_OS=$(uname -s | tr 'A-Z' 'a-z')
 case "$DL_OS" in
   mingw*|msys*) DL_OS="windows" ;;
 esac
-DL_ARCH=$(uname -m)
-case "$DL_ARCH" in
-  aarch64) DL_ARCH="arm64" ;;
-  x86_64)
-    # Rosetta detection
-    if [ "$DL_OS" = "darwin" ] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -qi apple; then
-      DL_ARCH="arm64"
-    else
-      DL_ARCH="amd64"
-    fi
-    ;;
-esac
+# Prefer a CI-provided SMOKE_ARCH over `uname -m`: on windows-11-arm the base
+# MSYS2 `uname` is an emulated x86_64 binary that reports "x86_64", so uname would
+# request the amd64 archive and 404. The smoke workflow passes the true matrix
+# arch (arm64/amd64). Fall back to uname when SMOKE_ARCH is unset (local runs).
+if [ -n "${SMOKE_ARCH:-}" ]; then
+  DL_ARCH="$SMOKE_ARCH"
+else
+  DL_ARCH=$(uname -m)
+  case "$DL_ARCH" in
+    aarch64) DL_ARCH="arm64" ;;
+    x86_64)
+      # Rosetta detection
+      if [ "$DL_OS" = "darwin" ] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -qi apple; then
+        DL_ARCH="arm64"
+      else
+        DL_ARCH="amd64"
+      fi
+      ;;
+  esac
+fi
 
 if [ "$DL_OS" = "darwin" ] || [ "$DL_OS" = "linux" ]; then
   DL_EXT="tar.gz"
@@ -1575,12 +1602,18 @@ DL_ARCHIVE_UI="codebase-memory-mcp-ui-${DL_OS}-${DL_ARCH}.${DL_EXT}"
 
 # 12a: curl download (try standard, then UI variant)
 echo "--- Phase 12a: curl download ---"
-if ! curl -fSL -o "$DL_DIR/$DL_ARCHIVE" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE" 2>/dev/null; then
+# --noproxy '*': never route the local test server through a proxy — a proxy env
+# var present on some runners (notably windows-11-arm) made curl fail to reach
+# 127.0.0.1 while the app's own downloader (WinHTTP) bypassed it. On failure,
+# surface curl's stderr instead of swallowing it so the reason is visible.
+if ! curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE" 2>/tmp/cbm-curl12a.err; then
   # Try UI variant
-  if curl -fSL -o "$DL_DIR/$DL_ARCHIVE_UI" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE_UI" 2>/dev/null; then
+  if curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE_UI" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE_UI" 2>>/tmp/cbm-curl12a.err; then
     DL_ARCHIVE="$DL_ARCHIVE_UI"
   else
     echo "FAIL 12a: curl download failed (tried standard and ui variants)"
+    echo "--- curl stderr (url: $SMOKE_DOWNLOAD_URL/$DL_ARCHIVE) ---"
+    cat /tmp/cbm-curl12a.err 2>/dev/null || true
     exit 1
   fi
 fi
@@ -1745,7 +1778,9 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   fi
 
   # 13f: run install.ps1
-  HOME="$PS1_TEST_HOME" CBM_DOWNLOAD_URL="$WIN_URL" \
+  # Pass the known-correct arch: powershell runs under x64 emulation on ARM64, so
+  # install.ps1's own detection can't tell it's arm64. DL_ARCH is authoritative here.
+  HOME="$PS1_TEST_HOME" CBM_DOWNLOAD_URL="$WIN_URL" CBM_ARCH="$DL_ARCH" \
     powershell.exe -ExecutionPolicy ByPass -File "$WIN_SCRIPT" "--dir=$WIN_DIR" 2>&1 || true
 
   # 13g: binary placed

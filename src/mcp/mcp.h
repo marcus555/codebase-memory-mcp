@@ -116,6 +116,18 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line);
 /* Handle a tools/call request. Returns MCP tool result JSON. */
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json);
 
+/* ── Supervised background index (RSS isolation, #832) ────────── */
+
+/* Run a full index of root_path in a supervised worker SUBPROCESS (the same
+ * crash/hang-isolating runner used by handle_index_repository), so the child
+ * returns 100% of its RSS to the OS on exit instead of ratcheting the long-lived
+ * parent. Builds {"repo_path": root_path} internally. Returns the worker's
+ * response string (caller frees) on success, or NULL to signal the caller must
+ * degrade to the in-process path (kill switch set, spawn failure, or the process
+ * is not a supervisor host). This is the shared entry the watcher re-index
+ * (main.c) and the session auto-index (mcp.c) route through. */
+char *cbm_mcp_index_run_supervised_path(const char *root_path);
+
 /* ── Idle store eviction ──────────────────────────────────────── */
 
 /* Evict the cached project store if idle for more than timeout_s seconds.

@@ -1323,35 +1323,58 @@ static TSNode find_decorator_args(TSNode call_node) {
     return args;
 }
 
+static bool is_route_string_kind(const char *kind) {
+    return strcmp(kind, "string") == 0 || strcmp(kind, "string_literal") == 0 ||
+           strcmp(kind, "interpreted_string_literal") == 0;
+}
+
+static const char *route_path_from_string_node(CBMArena *a, TSNode node, const char *source) {
+    if (!is_route_string_kind(ts_node_type(node))) {
+        return NULL;
+    }
+    char *path = cbm_node_text(a, node, source);
+    if (!path) {
+        return NULL;
+    }
+    int plen = (int)strlen(path);
+    if (plen >= PAIR_CHARS && (path[0] == '"' || path[0] == '\'')) {
+        path = cbm_arena_strndup(a, path + SKIP_CHAR, (size_t)(plen - PAIR_CHARS));
+    }
+    return (path && path[0] == '/') ? path : NULL;
+}
+
+static const char *find_route_path_literal(CBMArena *a, TSNode node, const char *source,
+                                           int max_depth) {
+    if (ts_node_is_null(node) || max_depth < 0) {
+        return NULL;
+    }
+    const char *path = route_path_from_string_node(a, node, source);
+    if (path || max_depth == 0) {
+        return path;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc && i < DECORATOR_SCAN_LIMIT; i++) {
+        path = find_route_path_literal(a, ts_node_named_child(node, i), source, max_depth - 1);
+        if (path) {
+            return path;
+        }
+    }
+    return NULL;
+}
+
 // Extract route path from decorator arguments (first string that starts with /).
 static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source) {
     uint32_t nc = ts_node_named_child_count(args);
     for (uint32_t ai = 0; ai < nc && ai < DECORATOR_SCAN_LIMIT; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
-        const char *ak = ts_node_type(arg);
-        /* Kotlin wraps each annotation argument in a `value_argument` node
-         * (and supports the named form `value = "/x"`); unwrap to the string. */
-        if (strcmp(ak, "value_argument") == 0) {
-            TSNode s = cbm_find_child_by_kind(arg, "string_literal");
-            if (ts_node_is_null(s)) {
-                continue;
-            }
-            arg = s;
-            ak = ts_node_type(arg);
-        }
-        if (strcmp(ak, "string") != 0 && strcmp(ak, "string_literal") != 0 &&
-            strcmp(ak, "interpreted_string_literal") != 0) {
-            continue;
-        }
-        char *path = cbm_node_text(a, arg, source);
+        /* Spring/Kotlin frequently uses named or array-valued annotation args:
+         *   @RequestMapping(value = ["/internal/v1"])
+         *   @GetMapping(path = {"/orders"})
+         * Walk a bounded subtree and keep the first string literal that is
+         * path-shaped, while ignoring non-route literals such as media types. */
+        const char *path = find_route_path_literal(a, arg, source, CBM_DESCENDANT_MAX_DEPTH);
         if (path) {
-            int plen = (int)strlen(path);
-            if (plen >= PAIR_CHARS && (path[0] == '"' || path[0] == '\'')) {
-                path = cbm_arena_strndup(a, path + SKIP_CHAR, (size_t)(plen - PAIR_CHARS));
-            }
-            if (path && path[0] == '/') {
-                return path;
-            }
+            return path;
         }
     }
     return NULL;
@@ -1655,6 +1678,38 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
     extract_route_from_annotations(a, func_node, source, spec, out_path, out_method);
 }
 
+static const char *join_route_paths(CBMArena *a, const char *prefix, const char *path) {
+    if (!path || !path[0]) {
+        return prefix;
+    }
+    if (!prefix || !prefix[0] || strcmp(prefix, "/") == 0) {
+        return path;
+    }
+    if (strcmp(path, "/") == 0) {
+        return prefix;
+    }
+    size_t plen = strlen(prefix);
+    bool prefix_slash = prefix[plen - 1] == '/';
+    bool path_slash = path[0] == '/';
+    if (prefix_slash && path_slash) {
+        return cbm_arena_sprintf(a, "%s%s", prefix, path + SKIP_CHAR);
+    }
+    if (!prefix_slash && !path_slash) {
+        return cbm_arena_sprintf(a, "%s/%s", prefix, path);
+    }
+    return cbm_arena_sprintf(a, "%s%s", prefix, path);
+}
+
+static const char *spring_class_route_prefix(CBMArena *a, TSNode class_node, const char *source,
+                                             const CBMLangSpec *spec) {
+    const char *prefix = NULL;
+    const char *method = NULL;
+    if (extract_route_from_annotations(a, class_node, source, spec, &prefix, &method)) {
+        return prefix;
+    }
+    return NULL;
+}
+
 // Extract decorator names from preceding decorator/annotation nodes
 // Count annotations inside a Java/Kotlin/C# "modifiers" node.
 static int count_modifier_annotations(TSNode modifiers, const CBMLangSpec *spec) {
@@ -1814,6 +1869,35 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
  * first and one branch is lost (#495). Fold the cfg predicate into the QN so
  * each cfg-gated twin gets a DISTINCT, predicate-encoding QN. Returns the
  * (possibly suffixed) QN; the original QN when no cfg attribute is present. */
+/* Rust: mark a function as a test when it carries a test attribute (#855).
+ * cbm's test detection is otherwise file-path-based (cbm_is_test_file:
+ * *_test.rs / test_*), so inline #[test]/#[tokio::test] functions inside a
+ * regular .rs file are indexed as ordinary Functions (is_test=false) and leak
+ * past the store.c `is_test != 1` filter into graph/agent context. The
+ * attribute_item text extract_decorators stores is the bracketed form
+ * ("#[test]", "#[tokio::test]", "#[tokio::test(...)]", ...). */
+static bool rust_def_is_test(const char *const *decorators) {
+    if (!decorators) {
+        return false;
+    }
+    for (int i = 0; decorators[i]; i++) {
+        const char *d = decorators[i];
+        /* Path-qualified async/param test macros (substring match, robust to the
+         * optional argument list and the surrounding #[ ]). */
+        if (strstr(d, "tokio::test") || strstr(d, "async_std::test") ||
+            strstr(d, "actix_rt::test") || strstr(d, "test_case::case")) {
+            return true;
+        }
+        /* Bare #[test] / #[test(...)]: match the bracketed path exactly so we do
+         * NOT match the unrelated #[test_case::case] (handled above) or a
+         * hypothetical #[test_crate]. */
+        if (strstr(d, "#[test]") || strstr(d, "#[test(")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
                                            const char *const *decorators) {
     if (!decorators) {
@@ -3137,6 +3221,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // predicate into the QN so both branches survive the graph upsert (#495).
     if (ctx->language == CBM_LANG_RUST) {
         def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
+        def.is_test = rust_def_is_test(def.decorators);
     }
 
     // Docstring
@@ -4000,8 +4085,8 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
 }
 
 // Push a single method definition
-static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_qn,
-                            const CBMLangSpec *spec, TSNode name_node) {
+static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
+                            const char *class_qn, const CBMLangSpec *spec, TSNode name_node) {
     CBMArena *a = ctx->arena;
 
     char *name = cbm_func_name_node_text(a, name_node, ctx->source);
@@ -4049,6 +4134,10 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_
 
     def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
+    if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN)) {
+        const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);
+        def.route_path = join_route_paths(a, prefix, def.route_path);
+    }
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 
     if (spec->branching_node_types && spec->branching_node_types[0]) {
@@ -4073,7 +4162,7 @@ static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, cons
         if (cbm_kind_in_set(inner, spec->function_node_types)) {
             TSNode nm = resolve_method_name(inner, ctx->language);
             if (!ts_node_is_null(nm)) {
-                push_method_def(ctx, inner, class_qn, spec, nm);
+                push_method_def(ctx, inner, impl_node, class_qn, spec, nm);
             }
         }
     }
@@ -4136,7 +4225,7 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             if (ts_node_is_null(fname)) {
                 continue;
             }
-            push_method_def(ctx, value, class_qn, spec, fname);
+            push_method_def(ctx, value, class_node, class_qn, spec, fname);
             continue;
         }
 
@@ -4149,7 +4238,7 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             continue;
         }
 
-        push_method_def(ctx, method_node, class_qn, spec, name_node);
+        push_method_def(ctx, method_node, class_node, class_qn, spec, name_node);
     }
 }
 

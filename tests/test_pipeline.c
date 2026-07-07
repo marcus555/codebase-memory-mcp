@@ -8,6 +8,7 @@
 #include "foundation/platform.h" // cbm_normalize_path_sep (drive-canonicalization regression)
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
@@ -23,6 +24,7 @@
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
 #include "yyjson/yyjson.h"
+#include "sqlite3.h" /* vendored/sqlite3 — PRAGMA integrity_check on dumped DBs */
 
 /* ── Helper: create temp test repo with known layout ───────────── */
 
@@ -907,6 +909,226 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     PASS();
 }
 
+/* TS/JS receiver-aware weak-strategy suppression (#592/#606 direction; Perl
+ * precedent #477). A member call x.foo() whose receiver TYPE the TS-LSP cannot
+ * resolve (a regex literal `re.test()`) must NOT be bound to a same-named
+ * project method by a weak short-name strategy — that fabricates a CALLS edge.
+ * Type-resolved receivers (`c.test()` on a typed SalesforceRestClient) and bare
+ * local calls must still resolve. < 50 files → sequential path (pass_calls.c).
+ * RED before the fix: checkFormat->test exists via unique_name/suffix_match. */
+static void write_temp_file(const char *dir, const char *name, const char *content);
+TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* The lone project symbol named "test" — a real method. */
+    write_temp_file(tmp, "src/client.ts",
+                    "export class SalesforceRestClient {\n"
+                    "  test(): boolean {\n"
+                    "    return true;\n"
+                    "  }\n"
+                    "}\n");
+    /* Regex receiver: `re.test(s)` calls RegExp.prototype.test, NOT the method.
+     * The TS-LSP cannot bind it to a project symbol → the registry would guess
+     * "test" by short name (weak). This is the false edge to suppress. */
+    write_temp_file(tmp, "src/caller.ts",
+                    "const re = /^[a-z]+$/;\n"
+                    "export function checkFormat(s: string): boolean {\n"
+                    "  return re.test(s);\n"
+                    "}\n");
+    /* Typed receiver: `c` is annotated SalesforceRestClient, so the TS-LSP
+     * resolves c.test() to the method (lsp_ts_method, conf 0.95) BEFORE the
+     * registry runs — the guard's explicit drop-list keeps every lsp_* edge. */
+    write_temp_file(tmp, "src/typed.ts",
+                    "import { SalesforceRestClient } from './client';\n"
+                    "export function runTyped(c: SalesforceRestClient): boolean {\n"
+                    "  return c.test();\n"
+                    "}\n");
+    /* Bare local call: same-module resolution, unaffected by the guard. */
+    write_temp_file(tmp, "src/local.ts",
+                    "function localHelper(): number {\n"
+                    "  return 1;\n"
+                    "}\n"
+                    "export function callsLocal(): number {\n"
+                    "  return localHelper();\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/tsjs_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* (1) The false edge is suppressed (reproduce-first: RED before the fix). */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "checkFormat", "test"));
+    /* (2) The type-resolved receiver call survives (LSP wins before the guard). */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "runTyped", "test"));
+    /* (3) The bare local call survives (same-module / lsp_ts_local). */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "callsLocal", "localHelper"));
+    /* (4) breadth insurance: the real edges are still emitted. */
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "CALLS"), 2);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Count nodes with the given exact name in the project (e.g. a Route path). */
+static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
+    cbm_node_t *ns = NULL;
+    int n = 0;
+    cbm_store_find_nodes_by_name(s, project, name, &ns, &n);
+    if (ns) {
+        cbm_store_free_nodes(ns, n);
+    }
+    return n;
+}
+
+/* Parallel-resolver regression for the TS/JS receiver guard (>= 50 files forces
+ * pass_parallel.c's resolve_file_calls). The guard must not drop a weak member
+ * match before the service classification runs — it suppresses ONLY the plain
+ * CALLS fall-through, so every service edge (HTTP_CALLS via the #523 callee
+ * bypass or emit_service_edge's unconditional detect_url_in_args, Route via the
+ * ROUTE_REG fall-through, …) is emitted exactly as on main. These callees are
+ * classified by main's verb-suffix + URL-arg heuristic, NOT by an HTTP library
+ * name in the callee — a duplicated predicate keyed on the resolved QN lost them
+ * (axios.get, api.patch on a renamed-axios instance, supertest request(app).get).
+ * The regex false edge must stay suppressed in parallel too. CBM_WORKERS forces
+ * >1 worker so the parallel path is taken regardless of the host core count. */
+TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* The lone project symbols named get()/patch()/test() — weak short-name
+     * targets the registry mis-binds the member calls below to. */
+    write_temp_file(tmp, "src/thing.ts",
+                    "export class ApiThing {\n"
+                    "  get(): number {\n"
+                    "    return 1;\n"
+                    "  }\n"
+                    "  patch(): number {\n"
+                    "    return 2;\n"
+                    "  }\n"
+                    "  load(): number {\n"
+                    "    return 3;\n"
+                    "  }\n"
+                    "}\n"
+                    "export class Other {\n"
+                    "  test(): boolean {\n"
+                    "    return true;\n"
+                    "  }\n"
+                    "}\n");
+    /* Untyped axios: the HTTP signal is in the callee name, not the resolved QN
+     * (the registry mis-binds "get" to ApiThing.get). Must yield HTTP_CALLS. */
+    write_temp_file(tmp, "src/http.ts",
+                    "export function callApi() {\n"
+                    "  return axios.get('/api/orders');\n"
+                    "}\n");
+    /* Renamed axios instance `api`: no HTTP lib id in the callee — classified by
+     * the .patch verb suffix + URL arg. Must yield HTTP_CALLS (was lost when the
+     * exemption keyed on the resolved QN only). */
+    write_temp_file(tmp, "src/http2.ts",
+                    "export function callPatch(): unknown {\n"
+                    "  return api.patch('/plans/:id', {});\n"
+                    "}\n");
+    /* Supertest-style chained receiver `request(app).get('/y')` — untyped, verb
+     * suffix + URL arg. */
+    write_temp_file(tmp, "src/supertest.ts",
+                    "export function callSup(app: unknown): unknown {\n"
+                    "  return request(app).get('/y');\n"
+                    "}\n");
+    /* `dev.load('/data')`: `.load` is NOT a route suffix and `dev` is not an HTTP
+     * lib, so main classifies it via the unconditional detect_url_in_args (URL
+     * arg) -> HTTP_CALLS, while the weak plain match to ApiThing.load is the false
+     * edge that must be suppressed. This is exactly the detect_url_in_args path
+     * the previous (predicate-duplicating) guard skipped by dropping the call
+     * before emit_service_edge ran — the class of ~399 HTTP_CALLS it lost. */
+    write_temp_file(tmp, "src/load.ts",
+                    "export function callLoad(dev: unknown): unknown {\n"
+                    "  return dev.load('/api/data');\n"
+                    "}\n");
+    /* Route registration by callee suffix + a '/'-path arg. Must yield a Route. */
+    write_temp_file(tmp, "src/routes.ts",
+                    "function handler() {}\n"
+                    "export function reg(router: any) {\n"
+                    "  router.get('/users', handler);\n"
+                    "}\n");
+    /* Regex receiver: the false edge that must stay suppressed in parallel too. */
+    write_temp_file(tmp, "src/re.ts",
+                    "const re = /^[a-z]+$/;\n"
+                    "export function checkFormat(s: string): boolean {\n"
+                    "  return re.test(s);\n"
+                    "}\n");
+    /* Pad past MIN_FILES_FOR_PARALLEL (50) so the parallel resolver runs. */
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1); /* force parallel regardless of host cores */
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/tsjs_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* (1) Genuine HTTP_CALLS survive under the guard (>= 3):
+     *   - axios.get('/api/orders') -> 2 edges (recognized lib #523 callee bypass
+     *     + detect_url_in_args), and
+     *   - dev.load('/api/data')    -> 1 edge via detect_url_in_args, which runs
+     *     unconditionally after emit_service_edge's branch even when the plain
+     *     fall-through is suppressed.
+     * dev.load is the class the predicate-duplicating guard lost: `.load` is not
+     * a route suffix and `dev` is not an HTTP lib, so it was dropped before
+     * emit_service_edge ran (RED on that guard: only axios's 2). */
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 3);
+    /* (2) The verb-suffix + route-path member calls keep their route
+     * registrations (edge type CALLS -> a Route node named by the path). These
+     * classify as route_registration on main, NOT HTTP_CALLS — Option A preserves
+     * that by construction. Assert the three Route paths survive:
+     * api.patch('/plans/:id'), request(app).get('/y'), router.get('/users'). */
+    ASSERT_GTE(count_nodes_named(s, project, "/plans/:id"), 1);
+    ASSERT_GTE(count_nodes_named(s, project, "/y"), 1);
+    ASSERT_GTE(count_nodes_named(s, project, "/users"), 1);
+    /* (3) The false plain-CALLS edges are suppressed in parallel: the regex
+     * receiver and the dev.load weak match to ApiThing.load. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "checkFormat", "test"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "callLoad", "load"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* ── Git history pass tests ─────────────────────────────────────── */
 
 TEST(githistory_is_trackable) {
@@ -1686,6 +1908,61 @@ TEST(pipeline_python_project) {
     cbm_store_find_nodes_by_label(s, proj, "Method", &methods, &mc);
     ASSERT_GTE(mc, 1); /* transform */
     cbm_store_free_nodes(methods, mc);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* #768 end-to-end: `import { A, B } from './lib'` must survive the REAL
+ * pipeline (extract -> gbuf dedup -> raw SQLite dump) as TWO IMPORTS edges
+ * with distinct local_name — and the dumped DB must satisfy its own schema.
+ * With only the graph-buffer half of the fix, both edges reach the dump but
+ * violate an unwidened UNIQUE(source_id,target_id,type), which PRAGMA
+ * integrity_check flags as a non-unique autoindex entry. */
+TEST(pipeline_imports_multi_symbol_edges) {
+    const char *files[] = {"consumer.ts", "lib.ts"};
+    const char *contents[] = {
+        "import { A, B } from './lib';\n\nexport function useBoth() {\n  return A() + B();\n}\n",
+        "export function A() {\n  return 1;\n}\nexport function B() {\n  return 2;\n}\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    /* The dumped DB must pass SQLite's own full integrity check — this is
+     * what catches a buffer-only fix shipping DBs that violate their own
+     * UNIQUE constraint. */
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(db, &raw), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(raw, "PRAGMA integrity_check", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    const char *integrity = (const char *)sqlite3_column_text(stmt, 0);
+    ASSERT_STR_EQ(integrity, "ok");
+    sqlite3_finalize(stmt);
+    sqlite3_close(raw);
+
+    /* Both named imports must be queryable as separate IMPORTS edges. */
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, proj, "IMPORTS", &edges, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(strstr(edges[0].properties_json, "\"local_name\":\"A\"") != NULL ||
+                strstr(edges[1].properties_json, "\"local_name\":\"A\"") != NULL);
+    ASSERT_TRUE(strstr(edges[0].properties_json, "\"local_name\":\"B\"") != NULL ||
+                strstr(edges[1].properties_json, "\"local_name\":\"B\"") != NULL);
+    cbm_store_free_edges(edges, count);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -4669,7 +4946,7 @@ TEST(envscan_secret_value_exclusion) {
     write_temp_file(
         tmpdir, "deploy.sh",
         "#!/bin/bash\n"
-        "export GH_URL=\"https://ghp_abcdefghijklmnopqrstuvwxyz1234567890@github.com/repo\"\n"
+        "export GH_URL=\"https://ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE@github.com/repo\"\n"
         "export NORMAL_ENDPOINT=\"https://api.example.com/orders\"\n");
 
     cbm_env_binding_t bindings[32];
@@ -4784,6 +5061,129 @@ TEST(envscan_non_url_values_skipped) {
     int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
 
     ASSERT_EQ(count, 0);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* ── Discovery-exclusion plumbing in auxiliary repo walks (#792) ── */
+
+/* Boundary semantics of the shared exclusion predicate: anchored at the
+ * repo root, matches the excluded dir itself and its subtree, but never
+ * sibling names sharing a prefix. Regression guard for issue #792. */
+TEST(pipeline_relpath_excluded_boundary) {
+    char *excluded[] = {(char *)"vendor_big", (char *)"packages/big"};
+
+    /* Exact match and subtree paths are excluded. */
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("vendor_big", excluded, 2));
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("vendor_big/lib/package.json", excluded, 2));
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("packages/big", excluded, 2));
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("packages/big/src/x.ts", excluded, 2));
+
+    /* Sibling names sharing the prefix are NOT excluded ('/'-boundary). */
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_bigger", excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor", excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("packages/bigger/x.ts", excluded, 2));
+
+    /* Exclusions are root-anchored prefixes, not substring matches. */
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("src/vendor_big/x.c", excluded, 2));
+
+    /* NULL / empty safety. */
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded(NULL, excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("", excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_big", NULL, 0));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_big", excluded, 0));
+    char *with_empty[] = {(char *)""};
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_big", with_empty, 1));
+    PASS();
+}
+
+/* Helper: does the entries array contain a package with this name? */
+static int pkg_entries_has_name(const cbm_pkg_entries_t *e, const char *name) {
+    for (int i = 0; i < e->count; i++) {
+        if (e->items[i].pkg_name && strcmp(e->items[i].pkg_name, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* The pkgmap repo walk must honor discovery exclusions (issue #792: a
+ * gitignored huge subtree kept the pkgmap walk busy for 15 minutes).
+ * Control run first (no exclusions → BOTH manifests parsed) so the
+ * exclusion assertion below cannot pass vacuously. */
+TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_excl_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/packages", tmpdir);
+    cbm_mkdir(dir);
+    snprintf(dir, sizeof(dir), "%s/packages/app", tmpdir);
+    cbm_mkdir(dir);
+    snprintf(dir, sizeof(dir), "%s/vendor_big", tmpdir);
+    cbm_mkdir(dir);
+    snprintf(dir, sizeof(dir), "%s/vendor_big/lib", tmpdir);
+    cbm_mkdir(dir);
+
+    write_temp_file(tmpdir, "packages/app/package.json",
+                    "{\"name\":\"@org/app\",\"main\":\"index.js\"}\n");
+    write_temp_file(tmpdir, "vendor_big/lib/package.json",
+                    "{\"name\":\"@org/vendored\",\"main\":\"index.js\"}\n");
+
+    /* Control: NULL exclusion list — the walk reaches and parses BOTH
+     * manifests (proves the excluded one is reachable + parseable). */
+    cbm_pkg_entries_t control;
+    cbm_pkg_entries_init(&control);
+    cbm_pkgmap_scan_repo(tmpdir, &control, NULL, 0);
+    ASSERT_TRUE(pkg_entries_has_name(&control, "@org/app"));
+    ASSERT_TRUE(pkg_entries_has_name(&control, "@org/vendored"));
+    cbm_pkg_entries_free(&control);
+
+    /* With vendor_big excluded (as discovery reports for a gitignored
+     * subtree): the walk must not descend into it. */
+    char *excluded[] = {(char *)"vendor_big"};
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    cbm_pkgmap_scan_repo(tmpdir, &entries, excluded, 1);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "@org/app"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "@org/vendored"));
+    cbm_pkg_entries_free(&entries);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* The env-URL walk must honor discovery exclusions the same way (#792).
+ * Control run first via the NULL-exclusion wrapper so the exclusion
+ * assertion cannot pass vacuously. */
+TEST(envscan_walk_honors_discovery_exclusions) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_excl_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/big_generated", tmpdir);
+    cbm_mkdir(dir);
+
+    write_temp_file(tmpdir, "deploy.sh",
+                    "#!/bin/bash\nexport CONTROL_URL=\"https://api.example.com/v1\"\n");
+    write_temp_file(tmpdir, "big_generated/env.sh",
+                    "#!/bin/bash\nexport EXCLUDED_URL=\"https://excluded.example.com/v1\"\n");
+
+    /* Control: the NULL-exclusion wrapper sees both bindings. */
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "EXCLUDED_URL"));
+
+    /* With big_generated excluded, its binding must disappear. */
+    char *excluded[] = {(char *)"big_generated"};
+    count = cbm_scan_project_env_urls_excluded(tmpdir, bindings, 32, excluded, 1);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "EXCLUDED_URL") == NULL);
 
     th_rmtree(tmpdir);
     PASS();
@@ -6142,6 +6542,85 @@ TEST(pipeline_committed_counts_match_persisted) {
     PASS();
 }
 
+/* Reproduce-first (perf, linux-kernel finding): the extraction back-pressure
+ * gate must stop re-paying the full collect+nap tax on every file pull once a
+ * full nap cycle has failed to reclaim under budget. With CBM_MEM_BUDGET_MB=1
+ * the test process RSS is permanently over budget and NOTHING napping can
+ * change that (the resident floor IS the process) — napping is provably futile.
+ * OLD behavior: one full 40-spin nap cycle per pulled file (kernel index: ~63k
+ * pulls × ~120 ms ÷ 12 workers ≈ 390 s of idle workers at 79% avg CPU).
+ * FIXED: the first futile cycle flips a shared flag; later pulls proceed with
+ * the designed soft overshoot. Cycle count then can't exceed one cycle per
+ * worker (workers already inside the gate when the flag flips) plus re-probes.
+ * RED on the unfixed gate: cycles == file count (64) > cores+2.
+ * The counter (cbm_pp_bp_nap_cycles) makes this deterministic — no timing.
+ *
+ * The gate lives ONLY in the parallel extract path, so the fixture MUST exceed
+ * MIN_FILES_FOR_PARALLEL (50) — else the run routes sequential, the gate never
+ * fires, and the test would pass vacuously (cycles==0). The engagement assert
+ * below (cycles >= 1) is a hard guard against that regressing silently. */
+TEST(pipeline_backpressure_futile_nap_disengages) {
+    /* 64 tiny files: > MIN_FILES_FOR_PARALLEL (50) so the parallel path (and its
+     * back-pressure gate) actually runs; old-code cycles (~64) >> the bound. */
+    snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/cbm_test_XXXXXX");
+    if (!cbm_mkdtemp(g_tmpdir)) {
+        FAIL("failed to create temp dir");
+    }
+    for (int i = 0; i < 64; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/f%02d.go", g_tmpdir, i);
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            FAIL("failed to create fixture file");
+        }
+        fprintf(f, "package main\n\nfunc F%02d() int {\n\treturn %d\n}\n", i, i);
+        fclose(f);
+    }
+
+    /* 1 MB budget: over-budget on every pull, unreclaimable by napping.
+     * Set via the test hook, NOT setenv + cbm_mem_init: the init-once guard
+     * makes any re-init keep whatever budget the FIRST in-process init
+     * computed. The old env dance either failed to apply the 1 MB budget
+     * (some earlier test's init won the guard) or applied it permanently
+     * (this test's init won) — the "restore" re-init was then a silent
+     * no-op and the 1 MB budget leaked into every later budget consumer
+     * in the runner (mem_over_budget_low_rss went red suite-order-wide). */
+    size_t saved_budget = cbm_mem_budget();
+    cbm_mem_set_budget_for_tests((size_t)1024 * 1024);
+    ASSERT_TRUE(cbm_mem_budget() > 0);
+    ASSERT_TRUE(cbm_mem_over_budget());
+
+    cbm_pp_bp_nap_cycles_reset();
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    long cycles = cbm_pp_bp_nap_cycles();
+
+    /* Restore the caller-visible budget BEFORE asserting. */
+    cbm_mem_set_budget_for_tests(saved_budget);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+
+    ASSERT_EQ(rc, 0);
+    /* Engagement guard (anti-vacuous): the gate must have actually run — the
+     * parallel path taken and the 1 MB budget exceeded on every pull. cycles==0
+     * means the fixture routed sequential (or the gate was compiled out) and
+     * this test proved NOTHING; fail loudly rather than pass vacuously. */
+    if (cycles < 1) {
+        FAIL("back-pressure gate never engaged (cycles==0) — fixture routed sequential?");
+    }
+    /* Futile napping must disengage: at most one in-flight cycle per worker
+     * plus a small margin, never one per file (64). */
+    long bound = (long)cbm_system_info().total_cores + 2;
+    if (cycles > bound) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "nap cycles %ld > bound %ld (gate re-paid per pull)", cycles,
+                 bound);
+        FAIL(msg);
+    }
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -6155,6 +6634,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel);
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
+    /* Extraction back-pressure */
+    RUN_TEST(pipeline_backpressure_futile_nap_disengages);
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);
@@ -6177,6 +6658,8 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);
@@ -6197,6 +6680,7 @@ SUITE(pipeline) {
     RUN_TEST(usages_kotlin_no_duplicate_calls);
     /* Language integration tests */
     RUN_TEST(pipeline_python_project);
+    RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_go_type_classification);
@@ -6307,6 +6791,10 @@ SUITE(pipeline) {
     RUN_TEST(envscan_secret_file_exclusion);
     RUN_TEST(envscan_skips_ignored_dirs);
     RUN_TEST(envscan_non_url_values_skipped);
+    /* Discovery-exclusion plumbing in auxiliary repo walks (#792) */
+    RUN_TEST(pipeline_relpath_excluded_boundary);
+    RUN_TEST(pkgmap_scan_repo_honors_discovery_exclusions);
+    RUN_TEST(envscan_walk_honors_discovery_exclusions);
     /* Function registry / resolver */
     RUN_TEST(registry_resolve_single_candidate);
     RUN_TEST(registry_fuzzy_nonexistent);

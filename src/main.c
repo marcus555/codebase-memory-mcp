@@ -15,6 +15,7 @@
  */
 #include "cbm.h" // cbm_alloc_init — bind 3rd-party allocators to mimalloc before any sqlite/git init
 #include "mcp/mcp.h"
+#include "mcp/index_supervisor.h"
 #include "watcher/watcher.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
@@ -30,16 +31,19 @@ enum {
     MAIN_MAX_PORT = 65536,
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
 };
-#define MAIN_RAM_FRACTION 0.5
-
 #define SLEN(s) (sizeof(s) - 1)
 #include "foundation/log.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
 #include "foundation/profile.h"
+#include "foundation/win_utf8.h" /* cbm_wide_to_utf8 — Windows UTF-8 argv (#423/#20); no-op on POSIX */
+#ifdef _WIN32
+#include <shellapi.h> /* CommandLineToArgvW — not pulled in by windows.h under WIN32_LEAN_AND_MEAN */
+#endif
 #include "ui/config.h"
 #include "ui/http_server.h"
 #include "ui/embedded_assets.h"
@@ -50,6 +54,9 @@ enum {
 #include <string.h>
 #include <signal.h>
 #include <stdatomic.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #ifndef CBM_VERSION
 #define CBM_VERSION "dev"
@@ -120,9 +127,9 @@ static void *parent_watchdog_thread(void *arg) {
         /* initial_ppid > 1 guards against an already-orphaned start (ppid==1),
          * where a changing ppid carries no signal. */
         if (initial_ppid > 1 && getppid() != initial_ppid) {
-            cbm_log_warn("parent.exited", "reason", "ppid_changed");
-            request_shutdown();
-            exit(0);
+            static const char msg[] = "level=warn msg=parent.exited reason=ppid_changed\n";
+            (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            _exit(0);
         }
     }
     return NULL;
@@ -165,6 +172,23 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     }
 
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
+
+    /* #832: route the re-index through the supervised worker subprocess so this
+     * long-lived server process hands its RSS back to the OS on every cycle
+     * instead of ratcheting (mimalloc v3 does not reclaim pages that worker
+     * threads abandon at exit). The child writes the DB; the parent only needs the
+     * return code. The pipeline lock (already held) still serialises re-indexes.
+     * Degrade to the in-process pipeline when the supervisor is off (kill switch)
+     * or the spawn fails. */
+    if (cbm_index_supervisor_should_wrap()) {
+        char *resp = cbm_mcp_index_run_supervised_path(root_path);
+        if (resp) {
+            free(resp);
+            cbm_pipeline_unlock();
+            return 0;
+        }
+        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+    }
 
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
@@ -226,6 +250,25 @@ static bool cli_strip_flag(int *argc, char **argv, const char *flag) {
         return true;
     }
     return false;
+}
+
+/* Strip a flag AND its following value from argv, returning the value (a pointer
+ * into the original argv strings, valid for the process lifetime) or NULL if the
+ * flag is absent. */
+static const char *cli_strip_flag_value(int *argc, char **argv, const char *flag) {
+    for (int i = 0; i < *argc; i++) {
+        if (strcmp(argv[i], flag) != 0) {
+            continue;
+        }
+        const char *value = (i + SKIP_ONE < *argc) ? argv[i + SKIP_ONE] : NULL;
+        int remove_count = value ? 2 : 1;
+        for (int j = i; j < *argc - remove_count; j++) {
+            argv[j] = argv[j + remove_count];
+        }
+        *argc -= remove_count;
+        return value;
+    }
+    return NULL;
 }
 
 /* Portable "is fd a terminal?" — _isatty on Windows, isatty on POSIX. */
@@ -295,6 +338,37 @@ static int run_cli(int argc, char **argv) {
 
     bool progress = cli_strip_flag(&argc, argv, "--progress");
     bool raw_json = cli_strip_flag(&argc, argv, "--json");
+
+    /* Supervisor worker role: when this process was spawned as a supervised index
+     * worker, run indexing in-process (never re-supervise) and write the result to
+     * the given file for the parent to read back. Stripped here so the tool
+     * dispatch below sees only the tool name + its args. */
+    bool index_worker = cli_strip_flag(&argc, argv, "--index-worker");
+    const char *response_out = cli_strip_flag_value(&argc, argv, "--response-out");
+    cbm_index_set_worker_role(index_worker, response_out);
+
+#ifndef _WIN32
+    /* #845: a supervised worker must not outlive its supervisor. If the parent
+     * dies without reaping us (agent killed, supervisor crashed), an orphaned
+     * worker would index on unsupervised — observed contributing to memory
+     * pressure during the 2026-07-04 host panics. Reuse the parent-death
+     * watchdog (safe outside server mode: on ppid change it only writes to
+     * stderr and _exit(0)s — no cleanup dependencies). Detached: the worker
+     * exits by returning from run_cli; exit() tears the thread down. Failure
+     * to start is non-fatal, same policy as the MCP-server watchdog. */
+    if (index_worker) {
+        static pid_t worker_initial_ppid; /* static: outlives run_cli for the thread */
+        worker_initial_ppid = getppid();
+        cbm_thread_t worker_watchdog_tid;
+        if (cbm_thread_create(&worker_watchdog_tid, PARENT_WATCHDOG_STACK_SIZE,
+                              parent_watchdog_thread, &worker_initial_ppid) == 0) {
+            (void)cbm_thread_detach(&worker_watchdog_tid);
+            cbm_log_info("worker.watchdog.start");
+        } else {
+            cbm_log_warn("worker.watchdog.unavailable", "reason", "thread_create_failed");
+        }
+    }
+#endif
 
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
@@ -390,10 +464,30 @@ static int run_cli(int argc, char **argv) {
     int exit_code = 0;
 
     if (result) {
+        /* Supervised worker: hand the full result string to the parent via the
+         * response file before printing (parent reads it back on a clean exit). */
+        const char *ro = cbm_index_worker_response_out();
+        if (ro) {
+            FILE *rf = cbm_fopen(ro, "wb");
+            if (rf) {
+                (void)fputs(result, rf);
+                (void)fclose(rf);
+            }
+        }
         if (raw_json) {
             printf("%s\n", result);
         } else {
             exit_code = cli_print_mcp_result(result);
+        }
+        if (cbm_index_worker_active()) {
+            /* Supervised worker: the response is delivered (file + stdout).
+             * Skip the multi-GB teardown (server/store frees) — the process
+             * dies now and the OS reclaims everything wholesale; piecemeal
+             * free() of a kernel-scale graph costs minutes. _Exit skips
+             * atexit/LSan by design for this prod worker path. */
+            cbm_log_info("index.worker.fast_exit", "action", "_Exit");
+            fflush(NULL);
+            _Exit(exit_code);
         }
         free(result);
     }
@@ -453,11 +547,11 @@ static int handle_subcommand(int argc, char **argv) {
             return 0;
         }
         if (strcmp(argv[i], "cli") == 0) {
-            cbm_mem_init(MAIN_RAM_FRACTION);
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return run_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "hook-augment") == 0) {
-            cbm_mem_init(MAIN_RAM_FRACTION);
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return cbm_cmd_hook_augment();
         }
         if (strcmp(argv[i], "install") == 0) {
@@ -513,14 +607,78 @@ static void setup_signal_handlers(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* On Windows the CRT hands main() an argv encoded in the active ANSI code page, so a
+ * non-ASCII CLI argument (e.g. a repo path like café_日本語_repo) is mangled before the
+ * program ever sees it — the documented `cli index_repository "<json>"` then fails with
+ * "repo_path is required" (#423/#20). Rebuild argv from the wide command line
+ * (GetCommandLineW → CommandLineToArgvW) and convert each element to UTF-8 so the rest
+ * of the program receives the same UTF-8 bytes it gets on POSIX. Returns a
+ * NULL-terminated argv and sets *out_argc, or NULL on any failure (caller then keeps
+ * the original narrow argv). The returned block lives for the whole process (argv must
+ * stay valid until exit), so it is intentionally never freed. */
+static char **cbm_win_utf8_argv(int *out_argc) {
+    int wargc = 0;
+    LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv) {
+        return NULL;
+    }
+    if (wargc <= 0) {
+        LocalFree(wargv);
+        return NULL;
+    }
+    char **u8argv = (char **)calloc((size_t)wargc + 1, sizeof(char *));
+    if (!u8argv) {
+        LocalFree(wargv);
+        return NULL;
+    }
+    for (int i = 0; i < wargc; i++) {
+        u8argv[i] = cbm_wide_to_utf8(wargv[i]);
+        if (!u8argv[i]) {
+            for (int j = 0; j < i; j++) {
+                free(u8argv[j]);
+            }
+            free(u8argv);
+            LocalFree(wargv);
+            return NULL;
+        }
+    }
+    LocalFree(wargv);
+    *out_argc = wargc;
+    return u8argv; /* NULL-terminated (calloc'd wargc+1) */
+}
+#endif /* _WIN32 */
+
 int main(int argc, char **argv) {
-    /* Defense-in-depth: bind tree-sitter, sqlite3, and libgit2 to mimalloc so a
+    /* Defense-in-depth: bind tree-sitter and sqlite3 to mimalloc so a
      * correct binary does not rely on the fragile MI_OVERRIDE symbol override
      * (#424). MUST be the VERY FIRST statement: SQLITE_CONFIG_MALLOC has to run
      * before the first sqlite3_open* (cbm_mcp_server_new → cbm_store_open_memory
      * below opens sqlite early), else sqlite3_config returns SQLITE_MISUSE and
      * the bind is silently ignored. No-op in the test build. */
     cbm_alloc_init();
+#ifdef _WIN32
+    /* Replace the ANSI-code-page argv the CRT handed us with a UTF-8 argv rebuilt from
+     * the wide command line, so non-ASCII CLI arguments survive (#423/#20). Falls back
+     * to the original argv if the wide rebuild fails. Done after cbm_alloc_init (which
+     * must stay the very first statement) but before argv is first read below. */
+    {
+        int win_argc = 0;
+        char **win_argv = cbm_win_utf8_argv(&win_argc);
+        if (win_argv) {
+            argc = win_argc;
+            argv = win_argv;
+        }
+    }
+#endif
+    /* #845: mark this process as the REAL binary so the index supervisor may
+     * wrap index_repository in a worker subprocess. Must run before any
+     * subcommand dispatch so MCP-server, CLI, and HTTP paths are all covered.
+     * Embedders of cbm_mcp_handle_tool (test binaries) never mark themselves,
+     * so they index in-process instead of re-invoking themselves as
+     * `<self> cli --index-worker …` (recursive suite re-runs / spawn chains). */
+    cbm_index_supervisor_mark_host();
+    cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init(); /* reads CBM_PROFILE env var, gates all prof macros */
     /* CBM_LOG_LEVEL support — distilled from #414 (closes #413). Apply before
      * the first log statement so the configured level governs all output. */
@@ -553,9 +711,7 @@ int main(int argc, char **argv) {
 #endif
 
     /* Default: MCP server on stdio */
-    cbm_mem_init(MAIN_RAM_FRACTION); /* 50% of RAM — safe now because mimalloc tracks ALL
-                                      * memory (C + C++ allocations) via global override.
-                                      * No more untracked heap blind spots. */
+    cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
     /* Store binary path for subprocess spawning + hook log sink */
     cbm_http_server_set_binary_path(argv[0]);
     cbm_log_set_sink_ex(cbm_ui_log_append, CBM_LOG_SINK_TEE);
@@ -633,6 +789,7 @@ int main(int argc, char **argv) {
     if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT > 0) {
         g_http_server = cbm_http_server_new(ui_cfg.ui_port);
         if (g_http_server) {
+            cbm_http_server_set_watcher(g_http_server, g_watcher);
             if (cbm_thread_create(&http_tid, 0, http_thread, g_http_server) == 0) {
                 http_started = true;
             }
