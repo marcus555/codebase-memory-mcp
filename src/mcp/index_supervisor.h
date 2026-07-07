@@ -54,6 +54,10 @@ bool cbm_index_supervisor_should_wrap(void);
  * across an index_repository call to prove indexing ran IN-PROCESS. */
 int cbm_index_supervisor_spawn_count(void);
 
+/* Test hook: single-threaded spawn count — must stay ZERO (production
+ * recovery is parallel-only; no sequential runs). */
+int cbm_index_supervisor_spawn_st_count(void);
+
 typedef struct {
     cbm_proc_outcome_t outcome; /* how the worker ended */
     int exit_code;              /* worker exit code (-1 if signalled) */

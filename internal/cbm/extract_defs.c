@@ -5691,6 +5691,58 @@ static void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
     s->data[s->top++] = (walk_defs_frame_t){node, enclosing_qn};
 }
 
+/* Push all children of `node` in REVERSE order (so they pop in source order)
+ * using a LINEAR traversal. Index-based ts_node_child(i) is O(i) per call in
+ * tree-sitter, so a reverse index loop is O(n^2) per node — a file whose
+ * root has ~580k flat siblings (ms-typescript's reallyLargeFile.ts fourslash
+ * fixture) needed ~1.7e11 child-iterator steps and hung extraction for
+ * hours; the supervisor then killed the silent worker as a hang and
+ * quarantined innocent files off the stale marker. Collect the children
+ * FORWARD with a TSTreeCursor (O(1) amortized per step) into a scratch
+ * buffer, then push in reverse. Small nodes keep the direct index loop —
+ * no cursor/buffer overhead on the overwhelmingly common case. */
+enum { WD_CURSOR_MIN_CHILDREN = 64 };
+
+/* Collect all `cc` children of `node` linearly via a TSTreeCursor into a
+ * malloc'd array (caller frees). Returns NULL for small nodes and on OOM —
+ * the caller then uses indexed ts_node_child access, which is fine (and
+ * cheaper) at small child counts and merely quadratic-but-correct on OOM. */
+static TSNode *wd_collect_children(TSNode node, uint32_t cc) {
+    if (cc < WD_CURSOR_MIN_CHILDREN) {
+        return NULL;
+    }
+    TSNode *buf = (TSNode *)malloc((size_t)cc * sizeof(TSNode));
+    if (!buf) {
+        return NULL;
+    }
+    TSTreeCursor cur = ts_tree_cursor_new(node);
+    uint32_t got = 0;
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            buf[got++] = ts_tree_cursor_current_node(&cur);
+        } while (got < cc && ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+    if (got != cc) {
+        /* Defensive: cursor and child_count disagree — fall back to indexed. */
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+static void wd_push_children_reverse(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
+    uint32_t cc = ts_node_child_count(node);
+    if (cc == 0) {
+        return;
+    }
+    TSNode *kids = wd_collect_children(node, cc);
+    for (int i = (int)cc - SKIP_CHAR; i >= 0; i--) {
+        wd_push(s, kids ? kids[i] : ts_node_child(node, (uint32_t)i), enclosing_qn);
+    }
+    free(kids);
+}
+
 // Push nested class nodes from a class body container onto the defs stack.
 // Iteratively walks into wrapper nodes (field_declaration, template_declaration).
 static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_stack_t *s,
@@ -5702,8 +5754,10 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_sta
     while (nc_stack.count > 0) {
         TSNode cur = ts_nstack_pop(&nc_stack);
         uint32_t nc = ts_node_child_count(cur);
+        /* Linear child access for wide class bodies (see wd_collect_children). */
+        TSNode *kids = wd_collect_children(cur, nc);
         for (int i = (int)nc - SKIP_CHAR; i >= 0; i--) {
-            TSNode child = ts_node_child(cur, (uint32_t)i);
+            TSNode child = kids ? kids[i] : ts_node_child(cur, (uint32_t)i);
             if (cbm_kind_in_set(child, spec->class_node_types)) {
                 wd_push(s, child, enclosing_qn);
             } else {
@@ -5714,6 +5768,7 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_sta
                 }
             }
         }
+        free(kids);
     }
 }
 
@@ -6220,10 +6275,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             // resolve a null name and, for grammars where the kind has a `name`
             // field, double-mint). Push children so nested tags/defs are still
             // traversed, then skip the generic func path.
-            uint32_t cc = ts_node_child_count(node);
-            for (int i = (int)cc - SKIP_CHAR; i >= 0; i--) {
-                wd_push(&s, ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn);
-            }
+            wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
             continue;
         }
 
@@ -6234,10 +6286,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             // generic extract_func_def below would double-mint a def whose name
             // still carries the quotes. Push children so nested defines are still
             // traversed, then skip the generic func path.
-            uint32_t cc = ts_node_child_count(node);
-            for (int i = (int)cc - SKIP_CHAR; i >= 0; i--) {
-                wd_push(&s, ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn);
-            }
+            wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
             continue;
         }
 
@@ -6262,10 +6311,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             (strcmp(kind, "export_item") == 0 || strcmp(kind, "import_item") == 0) &&
             ts_node_is_null(
                 find_first_descendant_by_kind(node, "func_type", CBM_DESCENDANT_MAX_DEPTH))) {
-            uint32_t cc = ts_node_child_count(node);
-            for (int i = (int)cc - SKIP_CHAR; i >= 0; i--) {
-                wd_push(&s, ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn);
-            }
+            wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
             continue;
         }
 
@@ -6303,10 +6349,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
          * the class/func paths on the namespace node itself. */
         if (is_namespace_scope_kind(ctx->language, kind)) {
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
-            uint32_t nsc = ts_node_child_count(node);
-            for (int i = (int)nsc - SKIP_CHAR; i >= 0; i--) {
-                wd_push(&s, ts_node_child(node, (uint32_t)i), new_enclosing);
-            }
+            wd_push_children_reverse(&s, node, new_enclosing);
             continue;
         }
 
@@ -6317,10 +6360,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             continue;
         }
 
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_CHAR; i >= 0; i--) {
-            wd_push(&s, ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn);
-        }
+        /* Default descent — THE hot loop: a file whose root has hundreds of
+         * thousands of flat siblings (580k comment lines in ms-typescript's
+         * reallyLargeFile.ts) lands here every visit, so linear child
+         * collection is mandatory (see wd_push_children_reverse). */
+        wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
     }
     free(s.data);
 }

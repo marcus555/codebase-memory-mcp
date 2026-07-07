@@ -99,6 +99,17 @@ typedef struct {
     /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
     char **excluded_dirs;
     int excluded_count;
+
+    /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
+     * shared per-language registries here; resolved_calls entries may BORROW
+     * strings owned by these registries, and the later calls pass still
+     * reads them — so the arena is OWNED and destroyed by
+     * run_sequential_pipeline AFTER all passes, never by the lsp_cross pass
+     * itself (destroying at pass end was a use-after-free in pass_calls).
+     * Mirrors the parallel path, where cross_lsp_arena outlives the fused
+     * resolve. */
+    CBMArena seq_cross_arena;
+    bool seq_cross_arena_live;
 } cbm_pipeline_ctx_t;
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,

@@ -161,4 +161,18 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
                         const char **imp_vals, int imp_count, bool js_mode, bool jsx_mode,
                         bool dts_mode);
 
+/* Per-file cross-LSP dispatch shared by the parallel resolve worker AND the
+ * sequential driver (one path = one semantics): module-def-index filter →
+ * shared prebuilt registry (overlay pattern, no per-file registry build) →
+ * per-file fallback with FILTERED defs for languages without a shared
+ * variant. rust_shared_get (nullable) supplies the lazily-built shared Rust
+ * registry for NULL-filter rust files. */
+void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
+                           int source_len, const char *rel, const char *def_module,
+                           const CBMCrossLspRegistries *cross_registries,
+                           const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
+                           int all_def_count, const char **imp_keys, const char **imp_vals,
+                           int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
+                           void *rust_shared_ctx);
+
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

@@ -24,8 +24,8 @@
 
 /* ── Constants ────────────────────────────────────────────────── */
 
-#define DEFAULT_MAX_NODES 2000
-#define HARD_MAX_NODES 200000
+#define DEFAULT_MAX_NODES 5000
+#define HARD_MAX_NODES 10000000
 #define BH_THETA 1.2f
 #define OCTREE_MAX_DEPTH 26   /* stop subdividing coincident points (OOM guard) */
 #define OCTREE_MIN_HALF 1e-4f /* minimum octree cell half-size */
@@ -173,16 +173,19 @@ static float rand_float(uint32_t *seed) {
     return (float)((*seed >> 16) & 0x7FFF) / 32768.0f - 0.5f;
 }
 
+/* Ceiling for a caller-requested node budget. CBM_UI_MAX_RENDER_NODES lowers
+ * (or raises, up to HARD_MAX_NODES) the ceiling for constrained deployments;
+ * without it the full hard ceiling is available to explicit requests. */
 static int render_node_limit(void) {
     const char *raw = getenv("CBM_UI_MAX_RENDER_NODES");
     if (!raw || !raw[0]) {
-        return DEFAULT_MAX_NODES;
+        return HARD_MAX_NODES;
     }
     errno = 0;
     char *end = NULL;
     long v = strtol(raw, &end, 10);
     if (errno != 0 || end == raw || *end != '\0' || v <= 0) {
-        return DEFAULT_MAX_NODES;
+        return HARD_MAX_NODES;
     }
     if (v > HARD_MAX_NODES) {
         return HARD_MAX_NODES;
@@ -190,9 +193,15 @@ static int render_node_limit(void) {
     return (int)v;
 }
 
+/* The default is a default, not a ceiling: an explicit request is honored up
+ * to the (env-adjustable) ceiling; only a missing/invalid request falls back
+ * to DEFAULT_MAX_NODES. */
 static int clamp_max_nodes(int requested) {
     int cap = render_node_limit();
-    if (requested <= 0 || requested > cap) {
+    if (requested <= 0) {
+        requested = DEFAULT_MAX_NODES;
+    }
+    if (requested > cap) {
         return cap;
     }
     return requested;
@@ -317,7 +326,17 @@ typedef struct {
 /* ── Local optimization (gentle, anchor-preserving) ───────────── */
 
 static void local_optimize(body_t *b, int n, const int *es, const int *ed, int ne) {
-    for (int iter = 0; iter < LOCAL_ITERATIONS; iter++) {
+    /* Scale iteration effort down for very large graphs: each iteration is
+     * O(n log n) octree work, and past ~100k bodies the anchor layout already
+     * dominates the visible structure — fewer refinement passes keep huge
+     * budgets responsive instead of multiplying minutes of compute. */
+    int iterations = LOCAL_ITERATIONS;
+    if (n > 500000) {
+        iterations = 10;
+    } else if (n > 100000) {
+        iterations = 20;
+    }
+    for (int iter = 0; iter < iterations; iter++) {
         for (int i = 0; i < n; i++) {
             b[i].fx = 0;
             b[i].fy = 0;

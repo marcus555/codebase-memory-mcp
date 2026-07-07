@@ -533,23 +533,39 @@ static int count_params_from_signature(const char *sig) {
  * or spins forever (an external-scanner infinite loop the quiet-timeout kills).
  * This gives an honest guard — green iff the supervisor actually contains a real
  * fault — instead of a fixture that may stop faulting once a root cause is fixed. */
-/* Crash-supervisor per-file marker (Stage 3c skip-and-continue). In the
- * supervisor's single-threaded recovery re-run, cbm_extract_file records the
- * file it is ABOUT to process here (CBM_INDEX_MARKER_FILE) before touching it,
- * so that if this file hard-crashes the worker the parent can read the marker
- * back and learn the EXACT crasher to quarantine. Only meaningful single-
- * threaded (parallel would race the marker); the env var is set solely by the
- * supervisor during recovery, so it is a no-op on every normal run. */
-static void cbm_index_write_marker(const char *rel_path) {
+/* Crash-supervisor per-file marker JOURNAL (Stage 3c skip-and-continue,
+ * parallel-safe). Recovery re-runs are PARALLEL (there are no sequential
+ * production runs), so a single overwrite-style marker would race across
+ * workers and — worse — go stale during non-extract phases, blaming
+ * whatever file was extracted LAST (that mis-quarantined four innocent
+ * ms-typescript fixtures, one 15-minute retry at a time). Instead every
+ * worker APPENDS one short line per event: "S <rel_path>" when it STARTS
+ * work on a file, "D <rel_path>" when it finishes it. A single short
+ * append of one line is atomic in practice on every target platform, and
+ * the parent discards a torn final line by design. The parent's suspect
+ * set after a crash/hang = files with an S but no D — exactly the
+ * in-flight set; a file is only quarantined after appearing in the
+ * suspect set of TWO CONSECUTIVE failed runs, so a stale or merely
+ * unlucky in-flight file is never quarantined alone. The env var is set
+ * solely by the supervisor during recovery — a no-op on normal runs. */
+static void cbm_index_mark(const char *rel_path, char event) {
     const char *mf = getenv("CBM_INDEX_MARKER_FILE");
     if (!mf || !mf[0] || !rel_path || !rel_path[0]) {
         return;
     }
-    FILE *f = cbm_fopen(mf, "wb");
+    FILE *f = cbm_fopen(mf, "ab");
     if (f) {
-        (void)fputs(rel_path, f);
+        (void)fprintf(f, "%c %s\n", event, rel_path);
         (void)fclose(f);
     }
+}
+
+void cbm_index_mark_start(const char *rel_path) {
+    cbm_index_mark(rel_path, 'S');
+}
+
+void cbm_index_mark_done(const char *rel_path) {
+    cbm_index_mark(rel_path, 'D');
 }
 
 /* ── Crash-quarantine set (Stage 3c skip-and-continue) ──────────────────────
@@ -667,9 +683,29 @@ static void cbm_test_fault_inject(const char *rel_path) {
     }
 }
 
+static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
+                                            CBMLanguage language, const char *project,
+                                            const char *rel_path, int64_t timeout_micros,
+                                            const char **extra_defines, const char **include_paths);
+
+/* Public entry: run the extraction and journal completion. The DONE mark on
+ * every ordinary return (including error/timeout results) tells the crash
+ * supervisor this file did NOT kill the worker — only a file whose S has no
+ * D is a crash/hang suspect. */
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
+    CBMFileResult *r = cbm_extract_file_impl(source, source_len, language, project, rel_path,
+                                             timeout_micros, extra_defines, include_paths);
+    cbm_index_mark_done(rel_path);
+    return r;
+}
+
+static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
+                                            CBMLanguage language, const char *project,
+                                            const char *rel_path, int64_t timeout_micros,
+                                            const char **extra_defines,
+                                            const char **include_paths) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
@@ -691,7 +727,7 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
         return result;
     }
 
-    cbm_index_write_marker(rel_path);
+    cbm_index_mark_start(rel_path);
     cbm_test_fault_inject(rel_path);
 
     // Get language spec

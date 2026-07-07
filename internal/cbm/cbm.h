@@ -532,6 +532,15 @@ bool cbm_index_is_quarantined(const char *rel_path);
 // extract loops to report the skip's phase in skipped[] (falls back to "crash").
 const char *cbm_index_quarantine_phase(const char *rel_path);
 
+// Crash-supervisor marker journal (parallel-safe): appends "S <rel_path>" /
+// "D <rel_path>" to CBM_INDEX_MARKER_FILE. Files with an S but no D form the
+// parent's crash/hang suspect set. No-ops when the env var is unset.
+// cbm_extract_file journals its own start/done; long-running per-file phases
+// (cross-LSP resolve) call these around their per-file work so a hang there
+// is attributed to the RIGHT file instead of a stale extraction marker.
+void cbm_index_mark_start(const char *rel_path);
+void cbm_index_mark_done(const char *rel_path);
+
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
 // timeout_micros: per-file parse timeout in microseconds (0 = no timeout).

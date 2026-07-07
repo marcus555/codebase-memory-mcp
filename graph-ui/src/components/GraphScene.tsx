@@ -9,6 +9,14 @@ import { EdgeLines } from "./EdgeLines";
 import { NodeLabels } from "./NodeLabels";
 import { NodeTooltip } from "./NodeTooltip";
 import type { GraphData, GraphNode, LinkedProject } from "../lib/types";
+import {
+  DEFAULT_DISPLAY_SETTINGS,
+  bloomIntensityScale,
+  nodeBoostScale,
+  type DisplaySettings,
+} from "../lib/density";
+
+const BASE_BLOOM_INTENSITY = 1.45;
 
 /* ── Camera fly-to animation ────────────────────────────── */
 
@@ -107,6 +115,7 @@ interface GraphSceneProps {
   highlightedIds: Set<number> | null;
   cameraTarget: CameraTarget | null;
   showLabels: boolean;
+  display?: DisplaySettings;
   onNodeClick: (node: GraphNode) => void;
 }
 
@@ -117,10 +126,20 @@ export function GraphScene({
   highlightedIds,
   cameraTarget,
   showLabels,
+  display = DEFAULT_DISPLAY_SETTINGS,
   onNodeClick,
 }: GraphSceneProps) {
   const [hovered, setHovered] = useState<GraphNode | null>(null);
   const controlsRef = useRef<OrbitControlsImpl | null>(null);
+
+  /* Adaptive density defaults × user multipliers. The automatic scale keeps
+   * contrast roughly constant as the graph grows; the sliders nudge it.
+   * NodeCloud applies `nodeBoost` directly (no internal density scaling),
+   * whereas EdgeLines scales by edge density itself — so it receives only the
+   * user edge-brightness multiplier to avoid double-applying. */
+  const nodeBoost = nodeBoostScale(data.nodes.length) * display.nodeGlow;
+  const bloomIntensity =
+    BASE_BLOOM_INTENSITY * bloomIntensityScale(data.nodes.length) * display.bloom;
 
   return (
     <Canvas
@@ -146,12 +165,14 @@ export function GraphScene({
         nodes={data.nodes}
         edges={data.edges}
         highlightedIds={highlightedIds}
+        brightness={display.edgeBrightness}
       />
       <NodeCloud
         nodes={data.nodes}
         highlightedIds={highlightedIds}
         onHover={setHovered}
         onClick={onNodeClick}
+        boost={nodeBoost}
       />
       {showLabels && <NodeLabels nodes={data.nodes} highlightedIds={highlightedIds} />}
 
@@ -170,6 +191,7 @@ export function GraphScene({
               edges={lp.edges}
               highlightedIds={null}
               opacity={0.3}
+              brightness={display.edgeBrightness}
             />
             <NodeCloud
               nodes={offsetNodes}
@@ -177,6 +199,7 @@ export function GraphScene({
               onHover={setHovered}
               onClick={onNodeClick}
               opacity={0.5}
+              boost={nodeBoost}
             />
             {/* Inter-galaxy CROSS_* edges: source is in primary, target in
              * this linked project's offset nodes. */}
@@ -187,6 +210,7 @@ export function GraphScene({
                 edges={lp.cross_edges}
                 highlightedIds={highlightedIds}
                 opacity={0.85}
+                brightness={display.edgeBrightness}
               />
             )}
           </group>
@@ -202,7 +226,7 @@ export function GraphScene({
         <Bloom
           luminanceThreshold={0.3}
           luminanceSmoothing={0.7}
-          intensity={1.2}
+          intensity={bloomIntensity}
           mipmapBlur
           radius={0.6}
         />

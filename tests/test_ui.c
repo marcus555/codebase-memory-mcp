@@ -358,6 +358,48 @@ TEST(layout_clamps_render_cap_from_env) {
     PASS();
 }
 
+/* A caller-requested budget above the default must be honored (up to the hard
+ * ceiling) when no env cap is set — the default is a default, not a ceiling. */
+TEST(layout_honors_budget_above_default) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+
+    const char *old_raw = getenv("CBM_UI_MAX_RENDER_NODES");
+    char *old_cap = old_raw ? strdup(old_raw) : NULL;
+    cbm_unsetenv("CBM_UI_MAX_RENDER_NODES");
+
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+
+    enum { BUDGET_NODES = 5100 };
+    for (int i = 0; i < BUDGET_NODES; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "fn%d", i);
+        snprintf(qn, sizeof(qn), "test::fn%d", i);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "a.c",
+                        .start_line = i,
+                        .end_line = i + 1};
+        cbm_store_upsert_node(store, &n);
+    }
+
+    cbm_layout_result_t *r =
+        cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, BUDGET_NODES);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->node_count, BUDGET_NODES);
+    ASSERT_EQ(r->total_nodes, BUDGET_NODES);
+
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    if (old_cap) {
+        cbm_setenv("CBM_UI_MAX_RENDER_NODES", old_cap, 1);
+        free(old_cap);
+    }
+    PASS();
+}
+
 TEST(layout_deterministic) {
     cbm_store_t *store = cbm_store_open_memory();
     ASSERT_NOT_NULL(store);
@@ -759,6 +801,7 @@ SUITE(ui) {
     RUN_TEST(layout_two_connected);
     RUN_TEST(layout_respects_max_nodes);
     RUN_TEST(layout_clamps_render_cap_from_env);
+    RUN_TEST(layout_honors_budget_above_default);
     RUN_TEST(layout_deterministic);
     RUN_TEST(layout_to_json);
     RUN_TEST(layout_null_inputs);

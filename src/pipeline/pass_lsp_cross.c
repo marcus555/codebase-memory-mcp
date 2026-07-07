@@ -621,6 +621,147 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
  * there is no readable Cargo.toml, leaving *out_m untouched. The resulting
  * manifest feeds cross-CRATE Rust resolution (#56): its [workspace].members
  * map lets `crate_a::foo` route to the member crate's def. */
+/* Per-file cross-LSP dispatch, shared by the PARALLEL resolve worker and the
+ * SEQUENTIAL driver. One code path = one semantics: filter the global defs
+ * down to the file's own+imported modules via the module-def index, resolve
+ * through the shared prebuilt registry when the language has one (per-file
+ * OVERLAY pattern — no registry build, no finalize), and only fall back to
+ * the per-file registry build (with the FILTERED defs) for languages without
+ * a shared-registry variant. Before this helper existed the sequential
+ * driver fed the FULL def list into full per-file registry builds —
+ * O(files x defs), which ground an 81k-file TS corpus for hours.
+ *
+ * `rust_shared_get` supplies the lazily-built shared Rust all-defs registry
+ * (the parallel resolver owns its once-guard); NULL means "no shared rust
+ * registry available" and rust NULL-filter files take the per-file build. */
+void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
+                           int source_len, const char *rel, const char *def_module,
+                           const CBMCrossLspRegistries *cross_registries,
+                           const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
+                           int all_def_count, const char **imp_keys, const char **imp_vals,
+                           int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
+                           void *rust_shared_ctx) {
+    if (!result) {
+        return;
+    }
+    bool used_prebuilt = false;
+    CBMTypeRegistry *prebuilt =
+        cross_registries ? cbm_pxc_registry_for_lang(cross_registries, lang) : NULL;
+    if (prebuilt) {
+        switch (lang) {
+        case CBM_LANG_GO:
+            /* Tier 3 (metadata-driven): pure lookup over the Tier-1
+             * lsp_unresolved entries — no parse, no AST walk. */
+            cbm_go_fast_resolve_qualified_calls(result, prebuilt, imp_keys, imp_vals, imp_count);
+            used_prebuilt = true;
+            break;
+        case CBM_LANG_PYTHON:
+            cbm_run_py_lsp_cross_with_registry(&result->arena, source, source_len, def_module,
+                                               prebuilt, imp_keys, imp_vals, imp_count,
+                                               result->cached_tree, &result->resolved_calls);
+            used_prebuilt = true;
+            break;
+        case CBM_LANG_C:
+        case CBM_LANG_CPP:
+        case CBM_LANG_CUDA:
+            cbm_run_c_lsp_cross_with_registry(
+                &result->arena, source, source_len, def_module, (lang != CBM_LANG_C), prebuilt,
+                imp_keys, imp_vals, imp_count, result->cached_tree, &result->resolved_calls);
+            used_prebuilt = true;
+            break;
+        case CBM_LANG_CSHARP:
+            cbm_run_cs_lsp_cross_with_registry(&result->arena, source, source_len, def_module,
+                                               prebuilt, imp_vals, imp_count, result->cached_tree,
+                                               &result->resolved_calls);
+            used_prebuilt = true;
+            break;
+        case CBM_LANG_JAVASCRIPT:
+        case CBM_LANG_TYPESCRIPT:
+        case CBM_LANG_TSX: {
+            /* TS: per-file OVERLAY chained to the shared base. Filter to
+             * own+imports so the overlay builder can pick out own-module
+             * defs without scanning the whole project. */
+            bool js;
+            bool jsx;
+            bool dts;
+            cbm_pxc_ts_modes(lang, rel, &js, &jsx, &dts);
+            CBMLSPDef *ts_defs = all_defs;
+            int ts_def_count = all_def_count;
+            CBMLSPDef *ts_filtered = NULL;
+            if (module_def_index) {
+                int fc = 0;
+                ts_filtered = cbm_pxc_filter_defs_for_file(module_def_index, all_defs, lang,
+                                                           result->namespace_name, def_module,
+                                                           imp_vals, imp_count, &fc);
+                if (ts_filtered) {
+                    ts_defs = ts_filtered;
+                    ts_def_count = fc;
+                }
+            }
+            cbm_run_ts_lsp_cross_with_registry(&result->arena, source, source_len, def_module, js,
+                                               jsx, dts, prebuilt, ts_defs, ts_def_count, imp_keys,
+                                               imp_vals, imp_count, result->cached_tree,
+                                               &result->resolved_calls);
+            free(ts_filtered);
+            used_prebuilt = true;
+            break;
+        }
+        /* PHP falls through to the per-file build path below until its
+         * overlay variant lands. */
+        default:
+            break;
+        }
+    }
+
+    if (used_prebuilt) {
+        return;
+    }
+    /* Fallback: gopls per-file filter + per-file registry build. RUST is
+     * exempt from the module filter: its resolution is Cargo-manifest-aware
+     * and a `crate_a::foo` reference routes to defs in ANOTHER workspace
+     * crate — a module that is in neither own_module nor the import map, so
+     * the filter starves cross-crate resolution (#56 repro red). Rust
+     * therefore always resolves against the FULL def universe: the lazily
+     * built shared registry when available, else a full per-file build. */
+    CBMLSPDef *filtered = NULL;
+    CBMLSPDef *file_defs = all_defs;
+    int file_def_count = all_def_count;
+    if (module_def_index && lang != CBM_LANG_RUST) {
+        int filtered_count = 0;
+        filtered =
+            cbm_pxc_filter_defs_for_file(module_def_index, all_defs, lang, result->namespace_name,
+                                         def_module, imp_vals, imp_count, &filtered_count);
+        if (filtered) {
+            file_defs = filtered;
+            file_def_count = filtered_count;
+        }
+    }
+    if (lang == CBM_LANG_RUST) {
+        CBMTypeRegistry *shared = rust_shared_get ? rust_shared_get(rust_shared_ctx) : NULL;
+        if (shared) {
+            cbm_run_rust_lsp_cross_with_registry(&result->arena, source, source_len, def_module,
+                                                 shared, imp_keys, imp_vals, imp_count,
+                                                 result->cached_tree, cbm_pxc_get_rust_manifest(),
+                                                 &result->resolved_calls,
+                                                 /*result=*/NULL);
+        } else {
+            cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
+                            imp_keys, imp_vals, imp_count);
+        }
+    } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        bool js;
+        bool jsx;
+        bool dts;
+        cbm_pxc_ts_modes(lang, rel, &js, &jsx, &dts);
+        cbm_pxc_run_one_ts(result, source, source_len, def_module, file_defs, file_def_count,
+                           imp_keys, imp_vals, imp_count, js, jsx, dts);
+    } else {
+        cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
+                        imp_keys, imp_vals, imp_count);
+    }
+    free(filtered);
+}
+
 static bool pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
                                     CBMCargoManifest *out_m) {
     if (!ctx || !ctx->repo_path || !marena || !out_m)
@@ -680,6 +821,32 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     CBMLSPDef *all_defs = cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
                                                    def_modules, &def_count);
 
+    /* Shared prepare (mirrors run_parallel_pipeline): inverted module-def
+     * index + per-language shared registries, built ONCE for the whole pass.
+     * The per-file loop below then dispatches through the SAME helper the
+     * parallel resolve worker uses — previously this driver handed the FULL
+     * def list to full per-file registry builds (O(files x defs); the
+     * ms-typescript sequential crawl). The registries live in the
+     * CALLER-OWNED ctx->seq_cross_arena: resolved_calls may borrow registry
+     * strings that the later calls pass still reads, so the arena must
+     * outlive this pass (run_sequential_pipeline destroys it after all
+     * passes; freeing here was a pass_calls use-after-free). */
+    CBMModuleDefIndex *module_def_index =
+        all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
+    CBMCrossLspRegistries cross_registries = {0};
+    if (all_defs) {
+        CBMArena *xa = &ctx->seq_cross_arena;
+        if (!ctx->seq_cross_arena_live) {
+            cbm_arena_init(xa);
+            ctx->seq_cross_arena_live = true;
+        }
+        cross_registries.go = cbm_go_build_cross_registry(xa, all_defs, def_count);
+        cross_registries.python = cbm_py_build_cross_registry(xa, all_defs, def_count);
+        cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, def_count);
+        cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
+        cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
+    }
+
     int processed = 0;
     int skipped_no_lsp = 0;
     int skipped_no_source = 0;
@@ -713,15 +880,14 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, &imp_keys, &imp_vals,
                              &imp_count);
 
-        if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
-            bool js, jsx, dts;
-            cbm_pxc_ts_modes(lang, files[i].rel_path, &js, &jsx, &dts);
-            cbm_pxc_run_one_ts(cache[i], source, source_len, def_modules[i], all_defs, def_count,
-                               imp_keys, imp_vals, imp_count, js, jsx, dts);
-        } else {
-            cbm_pxc_run_one(lang, cache[i], source, source_len, def_modules[i], all_defs, def_count,
-                            imp_keys, imp_vals, imp_count);
-        }
+        /* Journal around the resolve: a hang here must be attributed to THIS
+         * file, not to a stale extraction marker (the innocent-quarantine
+         * failure mode). */
+        cbm_index_mark_start(files[i].rel_path);
+        cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
+                              &cross_registries, module_def_index, all_defs, def_count, imp_keys,
+                              imp_vals, imp_count, NULL, NULL);
+        cbm_index_mark_done(files[i].rel_path);
         per_lang_calls++;
         processed++;
 
@@ -729,6 +895,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         free(source);
     }
 
+    cbm_pxc_free_module_def_index(module_def_index);
     free(all_defs);
     for (int i = 0; i < file_count; i++)
         free(def_modules[i]);

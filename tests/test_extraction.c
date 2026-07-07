@@ -7,6 +7,8 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
+#include <time.h>
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -2101,12 +2103,12 @@ TEST(python_calls) {
 }
 
 TEST(python_iris_classMethodValue) {
-    CBMFileResult *r = extract(
-        "import iris\n"
-        "iris_obj = iris.cls('%Library.ObjectScript')\n"
-        "def call_bfs(n):\n"
-        "    return iris_obj.classMethodValue('Graph.KG.TraversalBFS', 'BFSFastJson', n)\n",
-        CBM_LANG_PYTHON, "t", "store.py");
+    CBMFileResult *r =
+        extract("import iris\n"
+                "iris_obj = iris.cls('%Library.ObjectScript')\n"
+                "def call_bfs(n):\n"
+                "    return iris_obj.classMethodValue('Graph.KG.TraversalBFS', 'BFSFastJson', n)\n",
+                CBM_LANG_PYTHON, "t", "store.py");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call(r, "Graph.KG.TraversalBFS.BFSFastJson"));
@@ -3092,7 +3094,7 @@ TEST(complexity_go_method_receiver_self_recursion) {
     ASSERT_FALSE(r->has_error);
     const CBMDefinition *d = find_def(r, "save");
     ASSERT_NOT_NULL(d);
-    ASSERT_TRUE(d->is_recursive); /* s.save() == receiver s → self */
+    ASSERT_TRUE(d->is_recursive);         /* s.save() == receiver s → self */
     ASSERT_FALSE(d->unguarded_recursion); /* guarded by `if n > 0` */
     cbm_free_result(r);
 
@@ -3355,15 +3357,14 @@ TEST(walk_defs_no_truncation_over_4096_issue668) {
  * otherwise file-path-based (cbm_is_test_file), so test fns in a regular .rs
  * file leak. (#855) */
 TEST(extract_rust_test_attr_marks_is_test_issue855) {
-    CBMFileResult *r = extract(
-        "pub fn real_fn() {}\n"
-        "\n"
-        "#[test]\n"
-        "fn sync_test() {}\n"
-        "\n"
-        "#[tokio::test]\n"
-        "async fn async_test() {}\n",
-        CBM_LANG_RUST, "t", "src/lib.rs");
+    CBMFileResult *r = extract("pub fn real_fn() {}\n"
+                               "\n"
+                               "#[test]\n"
+                               "fn sync_test() {}\n"
+                               "\n"
+                               "#[tokio::test]\n"
+                               "async fn async_test() {}\n",
+                               CBM_LANG_RUST, "t", "src/lib.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
@@ -3390,9 +3391,109 @@ TEST(extract_rust_test_attr_marks_is_test_issue855) {
     PASS();
 }
 
+/* Reproduce-first (ms-typescript reallyLargeFile.ts, 2026-07-07): a file
+ * whose root node has hundreds of thousands of FLAT SIBLINGS (580k ////
+ * comment lines in the 3.5 MB fourslash fixture) hung extraction for over
+ * 15 minutes: walk_defs pushed children via index-based ts_node_child(i),
+ * which is O(i) per call in tree-sitter — O(n^2) per wide node (~1.7e11
+ * iterator steps on the real file; 100% of stack samples inside
+ * ts_node_child_iterator_next). The supervisor then killed the silent
+ * worker as a hang and, via the stale extraction marker, quarantined
+ * INNOCENT files on every retry.
+ *
+ * This fixture is an 80k-sibling flat file: quadratic child access needs
+ * minutes under ASan; the linear TSTreeCursor collection finishes in
+ * milliseconds. The 30 s bound has ~100x headroom over the fixed cost —
+ * RED on index-based child pushes, GREEN on the cursor walk. The def-count
+ * guard keeps the test honest: extraction must actually process the whole
+ * breadth, not skip it. */
+/* Extract a wide-flat comment-sibling fixture of n lines (the exact shape of
+ * ms-typescript's reallyLargeFile.ts: hundreds of thousands of flat comment
+ * children under the root, plus sparse real defs so the breadth check cannot
+ * pass vacuously). Returns elapsed milliseconds; stores the def count. */
+static long extract_wide_flat_ms(int n, int *out_defs) {
+    const size_t cap = (size_t)n * 24 + (size_t)8192; /* "// wide filler N\n" <= 24 chars */
+    char *src = malloc(cap);
+    if (!src) {
+        return -1;
+    }
+    size_t off = 0;
+    /* CONSTANT def count (10), independent of n: defs that scale WITH n make
+     * the fixture superlinear through the separate per-def sibling-scan cost
+     * (O(defs x siblings)) — on windows-CLANG64 ASan that pushed the ratio
+     * of LINEAR walk code to 43x. Ten spread-out defs keep the breadth check
+     * honest while the sibling-scan term stays 10 x n = linear. */
+    const int def_stride = n / 10;
+    for (int i = 0; i < n; i++) {
+        off += (size_t)snprintf(src + off, cap - off, "// wide filler %d\n", i);
+        if (i % def_stride == 0) {
+            off += (size_t)snprintf(src + off, cap - off, "var wide_a%d = %d;\n", i, i);
+        }
+    }
+    struct timespec a;
+    struct timespec b;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &a);
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)off, CBM_LANG_JAVASCRIPT, "proj", "wide.js", 0, NULL, NULL);
+    cbm_clock_gettime(CLOCK_MONOTONIC, &b);
+    free(src);
+    if (!r) {
+        return -1;
+    }
+    *out_defs = r->defs.count;
+    cbm_free_result(r);
+    return (b.tv_sec - a.tv_sec) * 1000L + (b.tv_nsec - a.tv_nsec) / 1000000L;
+}
+
+TEST(extract_wide_flat_file_is_linear) {
+    /* SCALING-RATIO guard: assert the COMPLEXITY CLASS, not a wall-clock
+     * bound. Index-based ts_node_child(i) child loops are O(i) per call —
+     * quadratic per wide node — and hung a 580k-sibling file for hours
+     * (ms-typescript reallyLargeFile.ts). An absolute time bound conflates
+     * machine speed with complexity: the gcc-13-ARM ASan CI leg runs this
+     * extraction ~200x slower than clang at the SAME (measured perfectly
+     * linear: 27.1s/54.2s/108.3s for 50k/100k/200k) complexity, and flunked
+     * a 30s bound on linear code. Growing the input 4x must grow the time
+     * ~4x when linear and ~16x when quadratic; the 10x bound splits those
+     * decisively on every toolchain. The 120ms floor keeps clock noise from
+     * mattering on fast machines. */
+    /* Growth and bound CALIBRATED FROM MEASUREMENT, not models. The ASan
+     * test build carries a large LINEAR per-line baseline (~31us/line on
+     * clang-macOS, ~540us/line on gcc-13-ARM) that dilutes small-growth
+     * ratios: at 8x growth the measured quadratic ratio was 22.4 — a 24x
+     * bound false-passed the known-quadratic pre-merge walk. At 20x growth
+     * the measured ratios are ~20x for linear code (both toolchains) and
+     * ~128x for the quadratic walk (clang-macOS) — bound 40 sits >=2x from
+     * both. The 120ms floor keeps clock noise irrelevant on fast hosts. */
+    enum { WF_SMALL = 20 * 1000, WF_BIG = 400 * 1000, WF_RATIO_MAX = 40, WF_FLOOR_MS = 120 };
+    int defs_small = 0;
+    int defs_big = 0;
+    long t_small = extract_wide_flat_ms(WF_SMALL, &defs_small);
+    long t_big = extract_wide_flat_ms(WF_BIG, &defs_big);
+    ASSERT_GTE(t_small, 0);
+    ASSERT_GTE(t_big, 0);
+    /* Anti-vacuous guard: the breadth was actually walked at both sizes. */
+    ASSERT_GTE(defs_small, 8);
+    ASSERT_GTE(defs_big, 8);
+    fprintf(stderr, "  [wide-flat] t(%d)=%ldms t(%d)=%ldms\n", WF_SMALL, t_small, WF_BIG, t_big);
+    long base = t_small > WF_FLOOR_MS ? t_small : WF_FLOOR_MS;
+    if (t_big > WF_RATIO_MAX * base) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "wide-flat scaling 20x input: %ldms -> %ldms (> %dx base %ldms) — "
+                 "quadratic child access",
+                 t_small, t_big, WF_RATIO_MAX, base);
+        FAIL(msg);
+    }
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
+
+    /* Wide-flat-file linearity (ms-typescript hang) */
+    RUN_TEST(extract_wide_flat_file_is_linear);
 
     /* Perl call-graph noise (#459 follow-up) */
     RUN_TEST(extract_perl_config_string_not_a_callee);

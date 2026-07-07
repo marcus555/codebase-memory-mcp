@@ -49,6 +49,7 @@ typedef struct {
     char path[2048];
     char query[2048];
     char origin[256];
+    char host[256];
     char accept_language[256];
     char *body;
     size_t body_len;

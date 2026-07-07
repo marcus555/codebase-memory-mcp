@@ -2584,6 +2584,12 @@ static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
     return p;
 }
 
+/* void*-typed adapter so the shared dispatch helper (pass_lsp_cross.c) can
+ * borrow the lazily-built shared Rust registry without knowing resolve_ctx_t. */
+static CBMTypeRegistry *pp_rust_shared_registry_get(void *ctx) {
+    return pp_rust_shared_registry((resolve_ctx_t *)ctx);
+}
+
 static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
@@ -2733,141 +2739,18 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
                 uint64_t lsp_t0 = extract_now_ns();
 
-                /* Tier 2 full fast path: pre-built per-language registry.
-                 * When available, skip the per-file registry build entirely
-                 * and pass the shared finalized registry. Dispatch per-lang
-                 * to the appropriate _with_registry variant. */
-                bool used_prebuilt = false;
-                CBMTypeRegistry *prebuilt = cbm_pxc_registry_for_lang(rc->cross_registries, lang);
-                if (prebuilt) {
-                    switch (lang) {
-                    case CBM_LANG_GO: {
-                        /* Tier 3 (metadata-driven): the per-file LSP
-                         * during extract ALREADY captured receiver-type
-                         * QNs and pkg-aliased call expressions inside
-                         * result->resolved_calls entries flagged with
-                         * strategy="lsp_unresolved". Cross-LSP is now a
-                         * pure lookup pass — iterate those, look up in
-                         * the global pre-built registry, emit resolved
-                         * entries on top. NO TREE-SITTER PARSE, NO AST
-                         * WALK. The slow path
-                         * (cbm_run_go_lsp_cross_with_registry) would
-                         * just re-derive the same metadata via a second
-                         * AST walk and arrive at the same answers — it
-                         * is now skipped entirely for Go. */
-                        cbm_go_fast_resolve_qualified_calls(result, prebuilt, imp_keys, imp_vals,
-                                                            imp_count);
-                        used_prebuilt = true;
-                        break;
-                    }
-                    case CBM_LANG_PYTHON:
-                        cbm_run_py_lsp_cross_with_registry(
-                            &result->arena, lsp_source, lsp_source_len, def_module, prebuilt,
-                            imp_keys, imp_vals, imp_count, result->cached_tree,
-                            &result->resolved_calls);
-                        used_prebuilt = true;
-                        break;
-                    case CBM_LANG_C:
-                    case CBM_LANG_CPP:
-                    case CBM_LANG_CUDA:
-                        cbm_run_c_lsp_cross_with_registry(
-                            &result->arena, lsp_source, lsp_source_len, def_module,
-                            (lang != CBM_LANG_C), prebuilt, imp_keys, imp_vals, imp_count,
-                            result->cached_tree, &result->resolved_calls);
-                        used_prebuilt = true;
-                        break;
-                    case CBM_LANG_CSHARP:
-                        cbm_run_cs_lsp_cross_with_registry(
-                            &result->arena, lsp_source, lsp_source_len, def_module, prebuilt,
-                            imp_vals, imp_count, result->cached_tree, &result->resolved_calls);
-                        used_prebuilt = true;
-                        break;
-                    case CBM_LANG_JAVASCRIPT:
-                    case CBM_LANG_TYPESCRIPT:
-                    case CBM_LANG_TSX: {
-                        /* TS uses a per-file OVERLAY chained to the shared
-                         * base (prebuilt): the file's own-module defs are
-                         * registered into the overlay so the AST refinement
-                         * passes can mutate them; imports/stdlib resolve via
-                         * the shared base. Filter to own+imports so the
-                         * overlay builder can pick out own-module defs. */
-                        bool js, jsx, dts;
-                        cbm_pxc_ts_modes(lang, rel, &js, &jsx, &dts);
-                        CBMLSPDef *ts_defs = rc->all_defs;
-                        int ts_def_count = rc->def_count;
-                        CBMLSPDef *ts_filtered = NULL;
-                        if (rc->module_def_index) {
-                            int fc = 0;
-                            ts_filtered = cbm_pxc_filter_defs_for_file(
-                                rc->module_def_index, rc->all_defs, lang, result->namespace_name,
-                                def_module, imp_vals, imp_count, &fc);
-                            if (ts_filtered) {
-                                ts_defs = ts_filtered;
-                                ts_def_count = fc;
-                            }
-                        }
-                        cbm_run_ts_lsp_cross_with_registry(
-                            &result->arena, lsp_source, lsp_source_len, def_module, js, jsx, dts,
-                            prebuilt, ts_defs, ts_def_count, imp_keys, imp_vals, imp_count,
-                            result->cached_tree, &result->resolved_calls);
-                        free(ts_filtered);
-                        used_prebuilt = true;
-                        break;
-                    }
-                    /* PHP falls through to the per-file build path below
-                     * until its overlay variant lands. */
-                    default:
-                        break;
-                    }
-                }
-
-                CBMLSPDef *filtered = NULL;
-                if (!used_prebuilt) {
-                    /* Fallback: gopls per-file filter + per-file registry build. */
-                    CBMLSPDef *file_defs = rc->all_defs;
-                    int file_def_count = rc->def_count;
-                    int filtered_count = 0;
-                    if (rc->module_def_index) {
-                        filtered = cbm_pxc_filter_defs_for_file(
-                            rc->module_def_index, rc->all_defs, lang, result->namespace_name,
-                            def_module, imp_vals, imp_count, &filtered_count);
-                        if (filtered) {
-                            file_defs = filtered;
-                            file_def_count = filtered_count;
-                        }
-                    }
-                    if (lang == CBM_LANG_RUST && !filtered) {
-                        /* Rust NULL-filter file (the ~all_defs amplifier) → resolve against
-                         * the LAZILY-built shared registry instead of rebuilding all_defs
-                         * per file. Byte-identical: a per-file all_defs build == the shared
-                         * all_defs build (def_module_qn always set). SUBSET rust files
-                         * (filtered != NULL) fall to the per-file build below, unchanged.
-                         * Manifest via the getter = same value cbm_pxc_run_one reads here. */
-                        CBMTypeRegistry *shared = pp_rust_shared_registry(rc);
-                        if (shared) {
-                            cbm_run_rust_lsp_cross_with_registry(
-                                &result->arena, lsp_source, lsp_source_len, def_module, shared,
-                                imp_keys, imp_vals, imp_count, result->cached_tree,
-                                cbm_pxc_get_rust_manifest(), &result->resolved_calls,
-                                /*result=*/NULL);
-                        } else {
-                            cbm_pxc_run_one(lang, result, lsp_source, lsp_source_len, def_module,
-                                            file_defs, file_def_count, imp_keys, imp_vals,
-                                            imp_count);
-                        }
-                    } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
-                               lang == CBM_LANG_TSX) {
-                        bool js, jsx, dts;
-                        cbm_pxc_ts_modes(lang, rel, &js, &jsx, &dts);
-                        cbm_pxc_run_one_ts(result, lsp_source, lsp_source_len, def_module,
-                                           file_defs, file_def_count, imp_keys, imp_vals, imp_count,
-                                           js, jsx, dts);
-                    } else {
-                        cbm_pxc_run_one(lang, result, lsp_source, lsp_source_len, def_module,
-                                        file_defs, file_def_count, imp_keys, imp_vals, imp_count);
-                    }
-                }
-                free(filtered);
+                /* Shared per-file dispatch (pass_lsp_cross.c): module-def
+                 * filter → shared prebuilt registry (overlay pattern) →
+                 * filtered per-file fallback. The SAME helper drives the
+                 * sequential pass — one path, one semantics. Journal the
+                 * file around the resolve so a hang HERE is attributed to
+                 * this file, not to a stale extraction marker. */
+                cbm_index_mark_start(rel);
+                cbm_pxc_dispatch_file(lang, result, lsp_source, lsp_source_len, rel, def_module,
+                                      rc->cross_registries, rc->module_def_index, rc->all_defs,
+                                      rc->def_count, imp_keys, imp_vals, imp_count,
+                                      pp_rust_shared_registry_get, rc);
+                cbm_index_mark_done(rel);
                 /* Free the on-demand re-read (no-op when source was retained). */
                 free_source(lsp_source_owned);
                 /* Contract: cbm_slab_reclaim() requires the thread parser to be

@@ -20,7 +20,7 @@ describe("formatGraphLimitNotice", () => {
     } satisfies GraphData;
 
     expect(formatGraphLimitNotice(data)).toBe(
-      "Showing 2,000 of 43,729 nodes. Use filters to narrow.",
+      "Showing 2,000 of 43,729 nodes (0 edges). Raise the node budget or use filters.",
     );
   });
 

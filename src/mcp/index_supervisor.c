@@ -53,6 +53,16 @@ int cbm_index_supervisor_spawn_count(void) {
     return g_spawn_count;
 }
 
+/* Test hook: counts SINGLE-THREADED spawns. Production recovery is parallel-
+ * only (there are no sequential production runs); this must stay ZERO on
+ * every supervised path — any nonzero count means a recovery/probe regressed
+ * to the sequential crawl that ground an 81k-file TS corpus for hours. */
+static int g_spawn_st_count = 0;
+
+int cbm_index_supervisor_spawn_st_count(void) {
+    return g_spawn_st_count;
+}
+
 /* #845: opt-in host mark — see the header. Set once from the real binary's
  * main(); embedders never set it, so should_wrap() stays false for them. */
 static bool g_host_marked = false;
@@ -137,6 +147,9 @@ static void worker_tmp_path(char *out, size_t out_sz, int pid, const char *suffi
 int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char *marker_file,
                            const char *quarantine_file, cbm_index_worker_result_t *result) {
     g_spawn_count++; /* test hook (#845) — see cbm_index_supervisor_spawn_count */
+    if (single_thread) {
+        g_spawn_st_count++; /* test hook — must stay 0: recovery is parallel-only */
+    }
     result->outcome = CBM_PROC_SPAWN_FAILED;
     result->exit_code = -1;
     result->term_signal = 0;

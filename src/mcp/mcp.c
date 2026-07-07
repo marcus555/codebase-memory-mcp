@@ -3529,23 +3529,93 @@ static void supervisor_tmp_path(char *out, size_t out_sz, const char *suffix) {
     }
 }
 
-/* Read the single-line crash marker (the rel_path the worker was processing when
- * it died). Returns a trimmed heap string (caller frees), or NULL when the marker
- * is empty/unreadable (i.e. the crash could not be attributed to a file). */
-static char *supervisor_read_marker(const char *path) {
+/* Parse the worker's marker JOURNAL ("S <rel>" / "D <rel>" lines, one event
+ * per line — see cbm_index_mark_start/done) into the crash/hang SUSPECT set:
+ * files whose last event is an S with no closing D, i.e. the in-flight set
+ * at kill time. Recovery runs are PARALLEL, so there are up to worker_count
+ * suspects; a torn final line (no trailing newline) is discarded by design.
+ * Returns a malloc'd array of malloc'd rel paths, OLDEST OPEN S FIRST (for a
+ * hang, the oldest still-open file IS the stuck one). Caller frees via
+ * supervisor_free_suspects. */
+static char **supervisor_read_suspects(const char *path, int *out_n) {
+    *out_n = 0;
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }
-    char buf[CBM_SZ_1K];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    (void)fclose(f);
-    buf[n] = '\0';
-    size_t len = strlen(buf);
-    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' || buf[len - 1] == ' ')) {
-        buf[--len] = '\0';
+    char **open_paths = NULL; /* open (S-without-D) files in first-S order */
+    int open_n = 0;
+    int open_cap = 0;
+    char line[CBM_SZ_1K];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        if (len == 0 || line[len - 1] != '\n') {
+            break; /* torn final line — discard and stop */
+        }
+        line[--len] = '\0';
+        if (len > 0 && line[len - 1] == '\r') {
+            line[--len] = '\0';
+        }
+        if (len < 3 || (line[0] != 'S' && line[0] != 'D') || line[1] != ' ') {
+            continue;
+        }
+        const char *rel = line + 2;
+        if (line[0] == 'S') {
+            bool already = false;
+            for (int i = 0; i < open_n && !already; i++) {
+                already = strcmp(open_paths[i], rel) == 0;
+            }
+            if (already) {
+                continue;
+            }
+            if (open_n == open_cap) {
+                int ncap = open_cap ? open_cap * 2 : 16;
+                char **np = (char **)realloc(open_paths, (size_t)ncap * sizeof(char *));
+                if (!np) {
+                    break;
+                }
+                open_paths = np;
+                open_cap = ncap;
+            }
+            open_paths[open_n++] = cbm_strdup(rel);
+        } else {
+            for (int i = 0; i < open_n; i++) {
+                if (strcmp(open_paths[i], rel) == 0) {
+                    free(open_paths[i]);
+                    memmove(&open_paths[i], &open_paths[i + 1],
+                            (size_t)(open_n - i - 1) * sizeof(char *));
+                    open_n--;
+                    break;
+                }
+            }
+        }
     }
-    return len > 0 ? cbm_strdup(buf) : NULL;
+    (void)fclose(f);
+    if (open_n == 0) {
+        free(open_paths);
+        return NULL;
+    }
+    *out_n = open_n;
+    return open_paths;
+}
+
+static void supervisor_free_suspects(char **s, int n) {
+    if (!s) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        free(s[i]);
+    }
+    free(s);
+}
+
+static bool supervisor_suspect_contains(char **s, int n, const char *rel) {
+    for (int i = 0; i < n; i++) {
+        if (s[i] && strcmp(s[i], rel) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Append one quarantine entry "rel\tphase\n" (phase = "crash"|"hang") to the
@@ -3597,12 +3667,22 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         return resp;
     }
 
-    /* Crash / hang / nonzero exit → skip-and-continue recovery. Re-run the worker
-     * single-threaded with a per-file marker; each time it crashes/hangs the
-     * marker names the exact crasher, which we append to the quarantine file
-     * before re-spawning. A clean single-threaded run then indexes the good files
-     * and reports the quarantined ones as phase="crash" skips (via the ordinary
-     * Stage-2 skip plumbing — no JSON merge needed). */
+    /* Crash / hang / nonzero exit → skip-and-continue recovery. Re-run the
+     * worker PARALLEL (there are no sequential production runs) with the
+     * per-file marker JOURNAL armed; after each failed run the journal's
+     * open-S set is the in-flight SUSPECT set. A file is quarantined only
+     * when it appears in the suspect sets of TWO CONSECUTIVE failed runs
+     * (intersection — a stale or merely unlucky in-flight file rotates out),
+     * and only ONE file per round: the OLDEST open S in the intersection
+     * (for a hang the oldest still-open file IS the stuck one; for a crash
+     * it is the longest-running suspect — the best single deterministic
+     * pick). A clean run then indexes the good files and reports the
+     * quarantined ones as phase="crash"/"hang" skips via the ordinary
+     * Stage-2 skip plumbing. The old design re-ran SINGLE-THREADED to keep
+     * one exact marker; at scale that fell into the sequential crawl, went
+     * quiet, was killed as a hang mid-pass, and the stale marker got FOUR
+     * innocent ms-typescript fixtures quarantined one 15-minute retry at a
+     * time. */
     cbm_proc_outcome_t last_outcome = wr.outcome;
     cbm_index_worker_result_free(&wr);
 
@@ -3627,10 +3707,13 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *resp = NULL;
-    int quarantined = 0; /* files pinned + added to the quarantine list so far */
+    int quarantined = 0;         /* files pinned + added to the quarantine list so far */
+    char **prev_suspects = NULL; /* previous failed round's in-flight set */
+    int prev_n = 0;
     for (int i = 0; i < cap; i++) {
         cbm_index_worker_result_t wr2;
-        int rc2 = cbm_index_spawn_worker(args, true, marker_path, quarantine_path, &wr2);
+        int rc2 = cbm_index_spawn_worker(args, /*single_thread=*/false, marker_path,
+                                         quarantine_path, &wr2);
         if (rc2 != 0) {
             last_outcome = wr2.outcome;
             cbm_index_worker_result_free(&wr2);
@@ -3645,30 +3728,49 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         if (wr2.outcome == CBM_PROC_CRASH || wr2.outcome == CBM_PROC_HANG) {
             last_outcome = wr2.outcome;
             cbm_index_worker_result_free(&wr2);
-            /* crash vs hang: the phase this file is quarantined under and reported
-             * as in skipped[]. A fault signal → "crash"; a no-progress kill →
-             * "hang". */
+            /* crash vs hang: the phase this file is quarantined under and
+             * reported as in skipped[]. A fault signal → "crash"; a
+             * no-progress kill → "hang". */
             const char *phase = (last_outcome == CBM_PROC_HANG) ? "hang" : "crash";
-            /* Attribute the failure to the file the marker pinned and quarantine it.
-             * If the marker is empty/unreadable we cannot attribute it to a single
-             * file → stop and report a contained failure. */
-            char *crasher = supervisor_read_marker(marker_path);
-            if (!crasher) {
+            int sus_n = 0;
+            char **suspects = supervisor_read_suspects(marker_path, &sus_n);
+            (void)remove(marker_path); /* fresh journal for the next re-run */
+            if (!suspects || sus_n == 0) {
+                supervisor_free_suspects(suspects, sus_n);
                 cbm_log_warn("index.supervisor.unattributable", "action", "give_up");
                 break;
             }
-            if (!supervisor_append_quarantine(quarantine_path, crasher, phase)) {
-                cbm_log_warn("index.supervisor.quarantine_write_fail", "path", crasher);
-                free(crasher);
-                break;
+            if (prev_suspects) {
+                /* Two-consecutive-strikes: quarantine the OLDEST open S that
+                 * was also in flight in the previous failed round. */
+                const char *pick = NULL;
+                for (int k = 0; k < sus_n && !pick; k++) {
+                    if (supervisor_suspect_contains(prev_suspects, prev_n, suspects[k])) {
+                        pick = suspects[k];
+                    }
+                }
+                if (!pick) {
+                    /* Disjoint consecutive in-flight sets: the failure is not
+                     * attributable to a recurring file (systemic) — stop
+                     * rather than quarantine an innocent. */
+                    supervisor_free_suspects(suspects, sus_n);
+                    cbm_log_warn("index.supervisor.unattributable", "action", "give_up");
+                    break;
+                }
+                if (!supervisor_append_quarantine(quarantine_path, pick, phase)) {
+                    cbm_log_warn("index.supervisor.quarantine_write_fail", "path", pick);
+                    supervisor_free_suspects(suspects, sus_n);
+                    break;
+                }
+                quarantined++;
+                char attempt_buf[MCP_FIELD_SIZE];
+                snprintf(attempt_buf, sizeof(attempt_buf), "%d", i + 1);
+                cbm_log_warn("index.file_quarantined", "path", pick, "outcome", phase, "attempt",
+                             attempt_buf);
             }
-            quarantined++;
-            char attempt_buf[MCP_FIELD_SIZE];
-            snprintf(attempt_buf, sizeof(attempt_buf), "%d", i + 1);
-            cbm_log_warn("index.file_quarantined", "path", crasher, "outcome", phase, "attempt",
-                         attempt_buf);
-            free(crasher);
-            (void)remove(marker_path); /* fresh marker for the next re-run */
+            supervisor_free_suspects(prev_suspects, prev_n);
+            prev_suspects = suspects;
+            prev_n = sus_n;
             continue;
         }
         /* SPAWN_FAILED / nonzero exit / non-fault kill → not a crash we can
@@ -3677,19 +3779,21 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         cbm_index_worker_result_free(&wr2);
         break;
     }
+    supervisor_free_suspects(prev_suspects, prev_n);
 
     (void)remove(marker_path); /* marker no longer needed */
 
     /* Terminal best-effort-partial: the loop exited WITHOUT a clean run (cap
      * exhausted, or an unattributable failure) but at least one file was already
-     * quarantined. Try ONE final single-threaded spawn with the accumulated
-     * quarantine and NO marker — every known-bad file short-circuits, so a clean
-     * run yields a PARTIAL index (all good files indexed, all known crashers/hangs
-     * reported as skips) rather than a hard failure. Bounded by the same quiet-
-     * timeout, so it cannot itself hang. Rare given monotonic progress. */
+     * quarantined. Try ONE final PARALLEL spawn with the accumulated quarantine
+     * and NO marker — every known-bad file short-circuits, so a clean run yields
+     * a PARTIAL index (all good files indexed, all known crashers/hangs reported
+     * as skips) rather than a hard failure. Bounded by the same quiet-timeout,
+     * so it cannot itself hang. Rare given monotonic progress. */
     if (!resp && quarantined > 0) {
         cbm_index_worker_result_t wrp;
-        int rcp = cbm_index_spawn_worker(args, true, NULL, quarantine_path, &wrp);
+        int rcp =
+            cbm_index_spawn_worker(args, /*single_thread=*/false, NULL, quarantine_path, &wrp);
         if (rcp == 0 && wrp.outcome == CBM_PROC_CLEAN && wrp.response) {
             resp = wrp.response; /* transfer ownership to caller */
             wrp.response = NULL;
@@ -3738,6 +3842,8 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path) {
     return index_run_supervised_path(NULL, root_path);
 }
 
+bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
      * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
@@ -3761,6 +3867,20 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
 
     repo_path = canonicalize_repo_path_if_exists(repo_path);
+
+    /* Optional workspace boundary: when CBM_ALLOWED_ROOT is set (agentic /
+     * multi-tenant deployments where repo_path may be influenced by an
+     * untrusted caller), refuse to index a path that resolves outside it.
+     * Unset by default, so the standard "index the path I gave you" behaviour
+     * is unchanged. */
+    const char *allowed_root = getenv("CBM_ALLOWED_ROOT");
+    if (allowed_root && allowed_root[0] && repo_path &&
+        !cbm_path_within_root(allowed_root, repo_path)) {
+        free(mode_str);
+        free(name_override);
+        free(repo_path);
+        return cbm_mcp_text_result("repo_path is outside the allowed root", true);
+    }
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         free(mode_str);
@@ -3976,19 +4096,19 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
 /* Resolve an absolute path from root_path + file_path, verify containment,
  * and read source lines. Sets *out_abs_path (caller frees). Returns source
  * string (caller frees) or NULL if path is invalid/unreadable. */
-static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
-                                    int end, char **out_abs_path) {
-    *out_abs_path = NULL;
-    if (!root_path || !file_path) {
-        return NULL;
+/* True only when abs_path, after realpath/_fullpath resolution (which collapses
+ * `..` and resolves symlinks/junctions), stays within root_path. This is the
+ * single containment guard every MCP file-read sink must pass before reading a
+ * file into a tool response: both the snippet path (resolve_snippet_source) and
+ * the search path (attach_result_source) route through it, so a result whose
+ * indexed path escapes the project root — via a `..` segment, or a symlink /
+ * Windows junction picked up during discovery — is never read back out. */
+bool cbm_path_within_root(const char *root_path, const char *abs_path) {
+    if (!root_path || !abs_path) {
+        return false;
     }
-    size_t apsz = strlen(root_path) + strlen(file_path) + MCP_SEPARATOR;
-    char *abs_path = malloc(apsz);
-    snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
-
     char real_root[CBM_SZ_4K];
     char real_file[CBM_SZ_4K];
-    bool path_ok = false;
 #ifdef _WIN32
     if (_fullpath(real_root, root_path, sizeof(real_root)) &&
         _fullpath(real_file, abs_path, sizeof(real_file))) {
@@ -4000,11 +4120,24 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
         size_t root_len = strlen(real_root);
         if (strncmp(real_file, real_root, root_len) == 0 &&
             (real_file[root_len] == '/' || real_file[root_len] == '\0')) {
-            path_ok = true;
+            return true;
         }
     }
+    return false;
+}
+
+static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
+                                    int end, char **out_abs_path) {
+    *out_abs_path = NULL;
+    if (!root_path || !file_path) {
+        return NULL;
+    }
+    size_t apsz = strlen(root_path) + strlen(file_path) + MCP_SEPARATOR;
+    char *abs_path = malloc(apsz);
+    snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
+
     *out_abs_path = abs_path;
-    if (path_ok) {
+    if (cbm_path_within_root(root_path, abs_path)) {
         return read_file_lines(abs_path, start, end);
     }
     return NULL;
@@ -4466,6 +4599,14 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
     char abs_path[CBM_SZ_1K];
     snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, r->file);
 
+    /* Containment: a search result whose indexed path resolves outside the
+     * project root (a `..` segment, or a symlink/junction that discovery
+     * followed) must not be read back into the response. Same guard the
+     * snippet path already uses. */
+    if (!cbm_path_within_root(root_path, abs_path)) {
+        return;
+    }
+
     if (mode == MODE_FULL) {
         char *source = read_file_lines(abs_path, r->start_line, r->end_line);
         if (source) {
@@ -4834,6 +4975,14 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
     int written = 0;
     if (fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
+            /* A source path never legitimately contains a newline or carriage
+             * return. Those bytes are exactly the record separator on the
+             * Windows filelist (and would split naive line readers elsewhere),
+             * so a crafted indexed path with an embedded newline could inject
+             * an extra entry into the scan set. Skip such paths entirely. */
+            if (strpbrk(indexed_files[fi], "\r\n") != NULL) {
+                continue;
+            }
             if (has_path_filter && path_regex) {
 #ifdef _WIN32
                 cbm_normalize_path_sep(indexed_files[fi]);
@@ -5248,8 +5397,12 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         base_branch = heap_strdup("main");
     }
 
-    /* Reject shell metacharacters in user-supplied branch name */
-    if (!cbm_validate_shell_arg(base_branch)) {
+    /* Reject shell metacharacters, and a leading '-', in the user-supplied
+     * branch name. base_branch is spliced into `git diff --name-only
+     * "<base>"...HEAD`; a value starting with '-' would be read by git as an
+     * option rather than a ref (e.g. `--output=<path>` writes the diff to an
+     * arbitrary file). A real git ref never begins with '-'. */
+    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-') {
         free(project);
         free(base_branch);
         free(scope);

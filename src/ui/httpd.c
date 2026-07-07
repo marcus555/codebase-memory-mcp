@@ -342,6 +342,8 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
 
         if (header_name_is(p, nlen, "origin")) {
             copy_header_value(colon + 1, eol, req->origin, sizeof(req->origin));
+        } else if (header_name_is(p, nlen, "host")) {
+            copy_header_value(colon + 1, eol, req->host, sizeof(req->host));
         } else if (header_name_is(p, nlen, "accept-language")) {
             copy_header_value(colon + 1, eol, req->accept_language, sizeof(req->accept_language));
         } else if (header_name_is(p, nlen, "transfer-encoding")) {

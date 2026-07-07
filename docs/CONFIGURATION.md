@@ -110,6 +110,7 @@ These environment variables affect runtime behavior:
 
 | Variable | Default | Description |
 |---|---|---|
+| `CBM_ALLOWED_ROOT` | *(unset)* | Restrict `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused; unset imposes no restriction. Useful when the server may be driven by an untrusted caller (agentic or multi-tenant deployments). |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the cache directory used for indexes, `_config.db`, and UI `config.json`. |
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |

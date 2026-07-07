@@ -801,6 +801,12 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free(seq_cache);
         ctx->result_cache = NULL;
     }
+    /* Release the lsp_cross pass's shared registries only now: resolved_calls
+     * borrowed registry-owned strings that the calls pass read above. */
+    if (ctx->seq_cross_arena_live) {
+        cbm_arena_destroy(&ctx->seq_cross_arena);
+        ctx->seq_cross_arena_live = false;
+    }
     return rc;
 }
 

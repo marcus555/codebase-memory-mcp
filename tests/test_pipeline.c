@@ -6621,6 +6621,78 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     PASS();
 }
 
+/* TS cross-registry test hooks (ts_lsp.c) — extern to avoid pulling the
+ * tree-sitter-typed ts_lsp.h into this store-level test. */
+extern long cbm_ts_full_registry_builds(void);
+extern void cbm_ts_full_registry_builds_reset(void);
+
+/* Reproduce-first (ms-typescript finding, 2026-07-07): the SEQUENTIAL
+ * cross-LSP driver must resolve TS files through the SHARED prebuilt
+ * registry, never a full per-file build. cbm_run_ts_lsp_cross registers
+ * stdlib + EVERY cross-file def + finalizes once PER FILE — O(files x defs).
+ * On an 81k-file TS corpus that ground one core for hours (74% of stack
+ * samples inside build_qn_index), and when the supervisor's quiet-timeout
+ * killed the crawl mid-pass, the stale extraction marker blamed innocent
+ * files, quarantining four of them one 15-minute retry at a time.
+ *
+ * The fixture stays UNDER MIN_FILES_FOR_PARALLEL (50) so the pipeline
+ * routes through the sequential driver — the path that lacked the
+ * shared-registry prepare.
+ * RED on the unfixed driver: full builds == TS file count (40).
+ * GREEN: full builds == 0 AND the cross-file TS call still resolves
+ * (quality guard — the shared path must not lose the edge). */
+TEST(pipeline_seq_ts_cross_uses_shared_registry) {
+    snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/cbm_test_XXXXXX");
+    if (!cbm_mkdtemp(g_tmpdir)) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/shared.ts", g_tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        FAIL("failed to create fixture file");
+    }
+    fputs("export function sharedHelper(): number {\n  return 42;\n}\n", f);
+    fclose(f);
+    for (int i = 0; i < 39; i++) {
+        snprintf(path, sizeof(path), "%s/caller%02d.ts", g_tmpdir, i);
+        f = fopen(path, "w");
+        if (!f) {
+            FAIL("failed to create fixture file");
+        }
+        fprintf(f,
+                "import { sharedHelper } from \"./shared\";\n"
+                "export function caller%02d(): number {\n  return sharedHelper();\n}\n",
+                i);
+        fclose(f);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/seqts.db", g_tmpdir);
+    cbm_ts_full_registry_builds_reset();
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    long builds = cbm_ts_full_registry_builds();
+
+    /* Quality guard FIRST: the cross-file call must resolve either way. */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    bool linked = false;
+    if (s) {
+        linked =
+            cross_file_call_exists(s, cbm_pipeline_project_name(p), "caller00", "sharedHelper");
+        cbm_store_close(s);
+    }
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(linked);
+    /* The point: ZERO full per-file registry builds on the sequential path. */
+    ASSERT_EQ(builds, 0);
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -6636,6 +6708,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_run_null);
     /* Extraction back-pressure */
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
+    /* Sequential cross-LSP shared registry (ms-typescript quadratic) */
+    RUN_TEST(pipeline_seq_ts_cross_uses_shared_registry);
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);

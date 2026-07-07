@@ -94,6 +94,74 @@ static const char *capture_logs_end(void) {
 
 /* ── Tests ───────────────────────────────────────────────────────── */
 
+/* Rewrite the "original_size" number in an artifact.json in place, adding
+ * `delta` to it. Returns false if the field / a digit run isn't found. */
+static bool bump_artifact_original_size(const char *meta_path, long delta) {
+    FILE *fp = fopen(meta_path, "rb");
+    if (!fp) {
+        return false;
+    }
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    char *key = strstr(buf, "\"original_size\"");
+    if (!key) {
+        return false;
+    }
+    char *colon = strchr(key, ':');
+    if (!colon) {
+        return false;
+    }
+    char *ds = colon + 1;
+    while (*ds == ' ' || *ds == '\t') {
+        ds++;
+    }
+    char *de = ds;
+    while (*de >= '0' && *de <= '9') {
+        de++;
+    }
+    if (de == ds) {
+        return false;
+    }
+    long val = strtol(ds, NULL, 10) + delta;
+    char out[4096];
+    int pre = (int)(ds - buf);
+    snprintf(out, sizeof(out), "%.*s%ld%s", pre, buf, val, de);
+    fp = fopen(meta_path, "wb");
+    if (!fp) {
+        return false;
+    }
+    fwrite(out, 1, strlen(out), fp);
+    fclose(fp);
+    return true;
+}
+
+/* The decompressed size is driven by the zstd frame's own content-size header,
+ * not the separately-stored original_size field (which travels in plaintext
+ * artifact.json and is trivially editable). A mismatch between the two must be
+ * rejected — this is the check that keeps the destination allocation and the
+ * decoder capacity pinned to the same verified size, so a doctored size can
+ * never make the decoder write past the buffer. */
+TEST(artifact_import_rejects_size_mismatch) {
+    setup_artifact_test();
+    create_test_db(g_db);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    char meta[1024];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", g_repo);
+    ASSERT_TRUE(
+        bump_artifact_original_size(meta, 4096)); /* claim 4 KiB more than the frame holds */
+
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    int rc = cbm_artifact_import(g_repo, import_db);
+    ASSERT_NEQ(rc, 0); /* must reject the mismatch, not import on the doctored size */
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 TEST(artifact_export_fast_roundtrip) {
     setup_artifact_test();
     create_test_db(g_db);
@@ -374,5 +442,6 @@ SUITE(artifact) {
     RUN_TEST(artifact_gitattributes_created);
     RUN_TEST(artifact_export_rename_failure_logs_specific_error);
     RUN_TEST(pipeline_persistence_export_failure_returns_error);
+    RUN_TEST(artifact_import_rejects_size_mismatch);
     RUN_TEST(artifact_null_safety);
 }

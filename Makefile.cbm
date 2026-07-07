@@ -112,7 +112,8 @@ FOUNDATION_SRCS = \
     src/foundation/profile.c \
     src/foundation/dump_verify.c \
     src/foundation/limits.c \
-    src/foundation/subprocess.c
+    src/foundation/subprocess.c \
+    src/foundation/sha256.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \

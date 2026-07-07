@@ -1652,6 +1652,16 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
 
     } while (check(p, TOK_COMMA));
 
+    /* Projection is materialized per row into fixed-width stack arrays sized at
+     * CBM_SZ_32 columns (execute_return_simple and its siblings). Bound the
+     * parsed item count to that width so an over-wide RETURN is rejected here
+     * instead of writing past those arrays downstream. */
+    if (r->count > CBM_SZ_32) {
+        free(r->items);
+        free(r);
+        return CBM_NOT_FOUND;
+    }
+
 tail:
     /* Optional ORDER BY */
     if (match(p, TOK_ORDER)) {

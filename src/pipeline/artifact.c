@@ -15,6 +15,13 @@ enum {
 };
 #define ART_BYTES_PER_MB ((size_t)1024 * 1024)
 
+/* Generous ceiling on an imported artifact's decompressed size. Real indexes
+ * (a full Linux-kernel DB is ~14 GB) fit comfortably; a frame that declares
+ * more than this is rejected before any allocation so a crafted content size
+ * can neither trigger a runaway allocation nor be used to desync the decoder
+ * capacity from the destination buffer. */
+#define ART_MAX_DECOMPRESSED_BYTES ((size_t)64 * 1024 * ART_BYTES_PER_MB)
+
 #include "pipeline/artifact.h"
 #include "store/store.h"
 #include "foundation/platform.h"
@@ -614,16 +621,29 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
     }
 
     /* Decompress */
-    char *decompressed = malloc(original_size);
+    /* Size the destination from the zstd frame's own content-size header, not
+     * from the separately-stored (attacker-controllable) original_size field.
+     * The allocation and the decoder capacity are then the SAME size_t value,
+     * so a crafted size can never make the capacity exceed the real buffer
+     * (the int-truncation that used to do exactly that is gone with the size_t
+     * signature). Require the metadata field to agree, and cap the total. */
+    size_t frame_size = cbm_zstd_frame_content_size(compressed, clen);
+    if (frame_size == 0 || frame_size > ART_MAX_DECOMPRESSED_BYTES || frame_size != original_size) {
+        free(compressed);
+        cbm_log_error("artifact.import", "err", "bad_decompressed_size");
+        return CBM_NOT_FOUND;
+    }
+
+    char *decompressed = malloc(frame_size);
     if (!decompressed) {
         free(compressed);
         return CBM_NOT_FOUND;
     }
 
-    int dlen = cbm_zstd_decompress(compressed, (int)clen, decompressed, (int)original_size);
+    int64_t dlen = cbm_zstd_decompress(compressed, clen, decompressed, frame_size);
     free(compressed);
 
-    if (dlen <= 0) {
+    if (dlen <= 0 || (size_t)dlen != frame_size) {
         free(decompressed);
         cbm_log_error("artifact.import", "err", "zstd_decompress");
         return CBM_NOT_FOUND;
