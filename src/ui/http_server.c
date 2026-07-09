@@ -1014,7 +1014,7 @@ static void *index_thread_fn(void *arg) {
      * --index-worker: this http_server spawn is already the crash-isolation layer,
      * so the child runs indexing in-process rather than spawning its own supervisor
      * (avoids redundant process nesting). */
-    char cmdline[2048];
+    char cmdline[4096];
     const char *const idx_argv[] = {bin,      "cli", "--index-worker", "index_repository",
                                     json_arg, NULL};
     if (!cbm_build_win_cmdline(cmdline, sizeof(cmdline), idx_argv)) {
