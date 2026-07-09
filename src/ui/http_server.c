@@ -116,7 +116,13 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     if (cfg) {
         cbm_config_close(cfg);
     }
-    cbm_http_replyf(c, 200, g_cors_json, "{\"lang\":\"%s\"}", lang_buf);
+    /* upstream_issues_url: where the missed-coverage callout (#963) sends
+     * edge-case reports. Served from the backend on purpose — the UI security
+     * audit forbids hardcoded external URLs in graph-ui source (external
+     * targets must come from an auditable backend response, same pattern as
+     * the /api/repo-info deep-links). */
+    cbm_http_replyf(c, 200, g_cors_json, "{\"lang\":\"%s\",\"upstream_issues_url\":\"%s\"}",
+                    lang_buf, "https://github.com/DeusData/codebase-memory-mcp/issues/new");
 }
 
 /* ── Server state ─────────────────────────────────────────────── */
