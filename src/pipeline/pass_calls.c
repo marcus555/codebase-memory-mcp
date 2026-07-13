@@ -248,13 +248,19 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
         prefix = broker ? broker : "async";
     }
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, qpath);
-    const char *rp;
-    if (svc == CBM_SVC_HTTP) {
-        rp = method ? method : "{}";
+    /* Valid-JSON route properties, byte-identical to the parallel path's
+     * build_service_route. The old code stored the RAW method/broker string
+     * (literally `bullmq`), which broke json_extract, the edges generated
+     * columns, and PRAGMA quick_check on every such cache (#898). */
+    char route_props[CBM_SZ_256];
+    if (method) {
+        snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method);
+    } else if (broker) {
+        snprintf(route_props, sizeof(route_props), "{\"broker\":\"%s\"}", broker);
     } else {
-        rp = broker ? broker : "{}";
+        snprintf(route_props, sizeof(route_props), "{}");
     }
-    return cbm_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, rp);
+    return cbm_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, route_props);
 }
 
 /* Insert an edge, splicing the call-site line (,"line":N) in before the closing
@@ -362,15 +368,23 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     char esc_url[CBM_SZ_256];
     cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
     cbm_json_escape(esc_url, sizeof(esc_url), url_or_topic);
+    /* Incremental build mirroring the parallel path's
+     * emit_http_async_service_edge: the old single format string closed the
+     * method value's quote but not the broker's, emitting
+     * "broker":"bullmq} on EVERY brokered ASYNC_CALLS edge — and its fixup
+     * only handled truncation, which never fires in the normal case (#898). */
     char props[CBM_SZ_512];
-    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}", esc_callee,
-             esc_url, method ? ",\"method\":\"" : "", method ? method : "", method ? "\"" : "",
-             broker ? ",\"broker\":\"" : "", broker ? broker : "");
-    if (broker) {
-        size_t plen = strlen(props);
-        if (plen > 0 && props[plen - SKIP_ONE] != '}') {
-            snprintf(props + plen - 1, sizeof(props) - plen + SKIP_ONE, "\"}");
-        }
+    int n = snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"", esc_callee,
+                     esc_url);
+    if (method && n > 0 && (size_t)n < sizeof(props)) {
+        n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"method\":\"%s\"", method);
+    }
+    if (broker && n > 0 && (size_t)n < sizeof(props)) {
+        n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"broker\":\"%s\"", broker);
+    }
+    if (n > 0 && (size_t)n < sizeof(props) - 1) {
+        props[n] = '}';
+        props[n + 1] = '\0';
     }
     calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), call);
 }
@@ -511,6 +525,18 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
          * Native `fetch()` (#856) belongs here too, not in the substring
          * tables above: it only counts as the global API once resolution has
          * already failed to find a local/imported `fetch` definition. */
+        /* Route registration on an unresolvable callee (#952): facade-style
+         * Laravel (`Route::get('/x', ...)`) — the facade class lives in
+         * vendor/ and is never indexed, so resolution is ALWAYS empty in real
+         * apps. Classify by callee suffix + path-shaped first arg, exactly
+         * like the parallel path's callee_suffix fallback; without this the
+         * sequential path minted zero Route nodes for such files. */
+        if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
+            call->first_string_arg[0] == '/') {
+            handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                      imp_count);
+            return SKIP_ONE;
+        }
         cbm_svc_kind_t esvc = cbm_service_pattern_match(call->callee_name);
         if (esvc == CBM_SVC_NONE && cbm_service_pattern_is_global_fetch(call->callee_name)) {
             esvc = CBM_SVC_HTTP;

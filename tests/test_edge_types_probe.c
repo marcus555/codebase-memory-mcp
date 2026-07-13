@@ -435,6 +435,52 @@ TEST(handles_laravel_php) {
     PASS();
 }
 
+/* #952: facade-style Laravel — the ONLY style real apps use, since the
+ * Illuminate facade lives in vendor/ and is never indexed. The callee of
+ * `Route::get(...)` (scoped_call_expression) was extracted as bare "get", so
+ * the empty-resolution route fallback ("::get" suffix table) never engaged
+ * and NO Route node minted — not even for flat registrations. Grouped routes
+ * additionally need the enclosing `prefix('/x')->group(...)` chain composed
+ * (same class as Spring's #734). Exact-set assertion distinguishes
+ * prefix-dropped from missing entirely. */
+TEST(handles_laravel_facade_routes_issue952) {
+    static const char *routes[] = {"/api/welcome", "/users/me", "/users/login",
+                                   "/companies/tenants/list", NULL};
+    static const EtFile f[] = {
+        {"routes/api.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+         "Route::get('/api/welcome', WelcomeController::class);\n"
+         "Route::prefix('/users')->middleware(DomainCheckMiddleware::class)"
+         "->group(function (): void {\n"
+         "    Route::get('/me', GetCurrentUserController::class);\n"
+         "    Route::post('/login', LoginUserController::class);\n"
+         "});\n"
+         "Route::prefix('companies')->group(function (): void {\n"
+         "    Route::prefix('tenants')->group(function (): void {\n"
+         "        Route::get('/list', ListTenantsController::class);\n"
+         "    });\n"
+         "});\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* #952 inverse guard: a non-router static call whose method name collides
+ * with a route verb (Cache::get) must NOT mint a Route node — the callee
+ * qualification is route-table-gated and the path gate requires a leading
+ * slash. */
+TEST(handles_laravel_facade_no_junk_routes_issue952) {
+    static const char *routes[] = {"/real", NULL};
+    static const EtFile f[] = {
+        {"routes/api.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+         "use Illuminate\\Support\\Facades\\Cache;\n\n"
+         "Route::get('/real', RealController::class);\n"
+         "$v = Cache::get('users.count');\n"
+         "$w = Cache::get('/leading/slash/key');\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
 /* Rails (Ruby) — ActionDispatch router.  The handler MUST be passed as a bare
  * identifier (not the idiomatic `to: 'list_items'` string, which extract_handler_arg
  * cannot capture).  mapper.get resolves by name to the Mapper#get method whose QN
@@ -1453,6 +1499,8 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_spring_kotlin);
     RUN_TEST(handles_aspnet_csharp);
     RUN_TEST(handles_laravel_php);
+    RUN_TEST(handles_laravel_facade_routes_issue952);
+    RUN_TEST(handles_laravel_facade_no_junk_routes_issue952);
     RUN_TEST(handles_rails_ruby);
     RUN_TEST(handles_actix_rust);
 

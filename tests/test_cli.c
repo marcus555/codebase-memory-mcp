@@ -20,6 +20,9 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #include <errno.h>
 #include <zlib.h>
 
@@ -2260,6 +2263,23 @@ TEST(cli_upsert_antigravity_mcp_replace) {
  *  Group C: Instructions File Upsert
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* #1032: Aider has no MCP support, but its installed CONVENTIONS.md told the
+ * model to call MCP tools it cannot invoke (search_graph(...) style). The
+ * Aider variant must teach the runnable CLI form instead. */
+TEST(cli_aider_instructions_are_cli_form_issue1032) {
+    const char *content = cbm_get_aider_instructions();
+    ASSERT_NOT_NULL(content);
+    /* Every discovery example is a runnable CLI command... */
+    ASSERT(strstr(content, "codebase-memory-mcp cli search_graph") != NULL);
+    ASSERT(strstr(content, "codebase-memory-mcp cli trace_path") != NULL);
+    ASSERT(strstr(content, "codebase-memory-mcp cli index_repository") != NULL);
+    /* ...and no bare MCP-call syntax remains to mislead the model. */
+    ASSERT_NULL(strstr(content, "search_graph(name_pattern"));
+    /* States the constraint explicitly. */
+    ASSERT(strstr(content, "no MCP support") != NULL);
+    PASS();
+}
+
 TEST(cli_upsert_instructions_fresh) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-instr-XXXXXX");
@@ -2447,7 +2467,12 @@ TEST(cli_hook_gate_script_no_predictable_tmp_issue384) {
     cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp");
 
     char script_path[512];
+#ifdef _WIN32
+    snprintf(script_path, sizeof(script_path), "%s/.claude/hooks/cbm-code-discovery-gate.cmd",
+             tmpdir);
+#else
     snprintf(script_path, sizeof(script_path), "%s/.claude/hooks/cbm-code-discovery-gate", tmpdir);
+#endif
     const char *data = read_test_file(script_path);
     ASSERT_NOT_NULL(data);
     /* No predictable temp/state file and no PPID-derived path. */
@@ -2455,6 +2480,63 @@ TEST(cli_hook_gate_script_no_predictable_tmp_issue384) {
     ASSERT(strstr(data, "PPID") == NULL);
     /* It delegates to the stateless compiled augmenter (stdout only). */
     ASSERT(strstr(data, "hook-augment") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* #929: on Windows, extensionless bash shims under .claude/hooks trigger the
+ * "How do you want to open this file?" dialog when editors (Cursor) scan the
+ * dir, and cannot execute without bash. Windows must install .cmd scripts
+ * (and remove the extensionless legacy twin on upgrade); POSIX keeps the
+ * extensionless bash form with no .cmd twin. */
+TEST(cli_hook_scripts_platform_shape_issue929) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook929-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char hooks_dir[512];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
+
+#ifdef _WIN32
+    /* Upgrade path: pre-create the pre-#929 extensionless file; the install
+     * must remove it so the Open-With trigger disappears. */
+    cbm_mkdir_p(hooks_dir, 0755);
+    char legacy_path[512];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    write_test_file(legacy_path, "#!/bin/bash\nexit 0\n");
+#endif
+
+    cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+
+    char script_path[512];
+#ifdef _WIN32
+    snprintf(script_path, sizeof(script_path), "%s/cbm-code-discovery-gate.cmd", hooks_dir);
+    const char *data = read_test_file(script_path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strncmp(data, "@echo off", 9) == 0); /* cmd, not bash */
+    ASSERT(strstr(data, "hook-augment") != NULL);
+    /* Legacy extensionless twin removed on upgrade. */
+    FILE *lf = fopen(legacy_path, "r");
+    if (lf) {
+        fclose(lf);
+        FAIL("legacy extensionless hook file still present after install");
+    }
+#else
+    snprintf(script_path, sizeof(script_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    const char *data = read_test_file(script_path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strncmp(data, "#!/usr/bin/env bash", 19) == 0);
+    /* No .cmd twin on POSIX. */
+    char cmd_path[512];
+    snprintf(cmd_path, sizeof(cmd_path), "%s/cbm-code-discovery-gate.cmd", hooks_dir);
+    FILE *cf = fopen(cmd_path, "r");
+    if (cf) {
+        fclose(cf);
+        FAIL(".cmd twin must not exist on POSIX");
+    }
+#endif
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -2478,6 +2560,77 @@ TEST(cli_hook_augment_path_is_abs) {
     ASSERT(!cbm_hook_path_is_abs(""));
     ASSERT(!cbm_hook_path_is_abs(NULL));
     PASS();
+}
+
+/* #858: a fired hook-augment deadline used to be a SILENT _exit(0) —
+ * indistinguishable from "no matches" — and the 300ms default self-terminated
+ * on real cold starts, so augmentation never appeared in real sessions
+ * (0/24 observed). The deadline is now env-configurable
+ * (CBM_HOOK_DEADLINE_MS, generous default) and a fired deadline leaves an
+ * observable breadcrumb in a local log. Deterministic reproduction: stdin is
+ * a pipe with a live writer that never sends data, so ha_read_stdin blocks
+ * past a 60ms deadline and the timer must fire, breadcrumb, and _exit(0). */
+TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
+#ifdef _WIN32
+    SKIP_PLATFORM("in-process SIGALRM deadline is POSIX-only (settings.json timeout on Windows)");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hookdl-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char logpath[512];
+    snprintf(logpath, sizeof(logpath), "%s/timeouts.log", tmpdir);
+
+    int fds[2];
+    if (pipe(fds) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("pipe failed");
+    }
+
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: hook-augment with a 60ms deadline and stdin that blocks
+         * forever (parent keeps the write end open, sends nothing). */
+        close(fds[1]);
+        dup2(fds[0], 0);
+        close(fds[0]);
+        setenv("CBM_HOOK_DEADLINE_MS", "60", 1);
+        setenv("CBM_HOOK_TIMEOUT_LOG", logpath, 1);
+        alarm(10); /* backstop: never hang the suite */
+        _exit(cbm_cmd_hook_augment());
+    }
+    ASSERT_GT(pid, 0);
+    close(fds[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    close(fds[1]);
+
+    /* The deadline must have fired as a clean exit 0 (fail-open, no signal). */
+    ASSERT(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    /* RED before the fix: no breadcrumb existed — a fired deadline was
+     * indistinguishable from a no-match run. GREEN: the log names the
+     * deadline and the knob. */
+    FILE *f = fopen(logpath, "r");
+    if (!f) {
+        fprintf(stderr, "  [858] FAIL no timeout breadcrumb written to %s\n", logpath);
+    }
+    ASSERT_NOT_NULL(f);
+    char line[256] = "";
+    char *got = fgets(line, sizeof(line), f);
+    fclose(f);
+    ASSERT_NOT_NULL(got);
+    ASSERT(strstr(line, "deadline_exceeded") != NULL);
+    ASSERT(strstr(line, "CBM_HOOK_DEADLINE_MS") != NULL);
+
+    cbm_unsetenv("CBM_HOOK_DEADLINE_MS");
+    cbm_unsetenv("CBM_HOOK_TIMEOUT_LOG");
+    test_rmdir_r(tmpdir);
+    PASS();
+#endif
 }
 
 TEST(cli_upsert_claude_hook_existing) {
@@ -2957,6 +3110,24 @@ TEST(cli_build_args_json_bare_boolean_issue680) {
     PASS();
 }
 
+/* An unknown flag for a KNOWN tool must be rejected loudly, not silently
+ * typed as a string and dropped server-side (#997). GF1 eval: `trace_path
+ * --max-depth 1` was accepted, the real --depth stayed at default 3, and
+ * the trace silently returned hop-2/3 results — silent-wrong output. The
+ * error names the closest valid flag as a suggestion. */
+TEST(cli_build_args_json_unknown_flag_rejected) {
+    char *err = NULL;
+    char *argv[] = {"--max-depth", "1"};
+    char *json = cbm_cli_build_args_json("trace_path", 2, argv, &err);
+    ASSERT_NULL(json);
+    ASSERT_NOT_NULL(err);
+    ASSERT(strstr(err, "unknown flag") != NULL);
+    ASSERT(strstr(err, "max-depth") != NULL);
+    ASSERT(strstr(err, "--depth") != NULL); /* nearest-flag suggestion */
+    free(err);
+    PASS();
+}
+
 /* A repeated array-typed flag accumulates into a JSON array. */
 TEST(cli_build_args_json_repeated_array_issue680) {
     char *err = NULL;
@@ -3183,6 +3354,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_antigravity_mcp_replace);
 
     /* Instructions file upsert (6 tests — group C) */
+    RUN_TEST(cli_aider_instructions_are_cli_form_issue1032);
     RUN_TEST(cli_upsert_instructions_fresh);
     RUN_TEST(cli_upsert_instructions_existing);
     RUN_TEST(cli_upsert_instructions_replace);
@@ -3192,7 +3364,9 @@ SUITE(cli) {
 
     /* Claude Code hooks (5 tests — group D) */
     RUN_TEST(cli_hook_gate_script_no_predictable_tmp_issue384);
+    RUN_TEST(cli_hook_scripts_platform_shape_issue929);
     RUN_TEST(cli_hook_augment_path_is_abs);
+    RUN_TEST(cli_hook_augment_deadline_breadcrumb_issue858);
     RUN_TEST(cli_upsert_claude_hook_fresh);
     RUN_TEST(cli_upsert_claude_hook_existing);
     RUN_TEST(cli_upsert_claude_hook_replace);
@@ -3226,6 +3400,7 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_string_flag_issue680);
     RUN_TEST(cli_build_args_json_integer_flag_issue680);
     RUN_TEST(cli_build_args_json_bare_boolean_issue680);
+    RUN_TEST(cli_build_args_json_unknown_flag_rejected);
     RUN_TEST(cli_build_args_json_repeated_array_issue680);
     RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);

@@ -1268,6 +1268,46 @@ static const char agent_instructions_content[] =
     "- Who calls it: `trace_path(function_name=\"OrderHandler\", direction=\"inbound\")`\n"
     "- Read source: `get_code_snippet(qualified_name=\"pkg/orders.OrderHandler\")`\n";
 
+/* #1032: Aider has NO MCP support — it reads CONVENTIONS.md but can only run
+ * shell commands. Installing the MCP-tool-centric instructions above told the
+ * model to call tools it cannot invoke. Aider gets a CLI-form variant: the
+ * exact same discovery priority, expressed as runnable `codebase-memory-mcp
+ * cli` commands (usable via Aider's /run or auto-approved shell). */
+static const char aider_instructions_content[] =
+    "# Codebase Knowledge Graph (codebase-memory-mcp)\n"
+    "\n"
+    "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
+    "Aider has no MCP support, so invoke the graph through the CLI (e.g. via /run).\n"
+    "ALWAYS prefer these commands over grep/glob/file-search for code discovery.\n"
+    "\n"
+    "## Priority Order (CLI form)\n"
+    "1. Find functions/classes/routes:\n"
+    "   codebase-memory-mcp cli search_graph "
+    "'{\"project\":\"<name>\",\"name_pattern\":\".*Foo.*\"}'\n"
+    "2. Who calls X / what does X call:\n"
+    "   codebase-memory-mcp cli trace_path "
+    "'{\"project\":\"<name>\",\"function_name\":\"Foo\",\"direction\":\"both\"}'\n"
+    "3. Read a specific function/class:\n"
+    "   codebase-memory-mcp cli get_code_snippet "
+    "'{\"project\":\"<name>\",\"qualified_name\":\"<qn>\"}'\n"
+    "4. Complex patterns (Cypher):\n"
+    "   codebase-memory-mcp cli query_graph '{\"project\":\"<name>\",\"query\":\"MATCH ...\"}'\n"
+    "5. Project overview:\n"
+    "   codebase-memory-mcp cli get_architecture '{\"project\":\"<name>\"}'\n"
+    "\n"
+    "First use in a repo: codebase-memory-mcp cli index_repository '{\"repo_path\":\"<abs "
+    "path>\"}'\n"
+    "List indexed projects (for <name>): codebase-memory-mcp cli list_projects '{}'\n"
+    "\n"
+    "## When to fall back to grep/glob\n"
+    "- Searching for string literals, error messages, config values\n"
+    "- Searching non-code files (Dockerfiles, shell scripts, configs)\n"
+    "- When the CLI returns insufficient results\n";
+
+const char *cbm_get_aider_instructions(void) {
+    return aider_instructions_content;
+}
+
 const char *cbm_get_agent_instructions(void) {
     return agent_instructions_content;
 }
@@ -1798,7 +1838,16 @@ int cbm_remove_junie_mcp(const char *config_path) {
 #define CMM_HOOK_MATCHER "Grep|Glob|Read"
 /* Basename only; the full command path is resolved at install time via
  * cbm_resolve_hook_command so $CLAUDE_CONFIG_DIR is honored. */
+#ifdef _WIN32
+/* #929: extensionless bash shims under %USERPROFILE%\\.claude\\hooks trigger
+ * the "How do you want to open this file?" dialog when editors (Cursor) scan
+ * the hooks dir, and cannot execute without bash anyway. Windows installs
+ * .cmd scripts; the extensionless legacy files are removed on upgrade. */
+#define CMM_HOOK_GATE_SCRIPT "cbm-code-discovery-gate.cmd"
+#else
 #define CMM_HOOK_GATE_SCRIPT "cbm-code-discovery-gate"
+#endif
+#define CMM_HOOK_GATE_SCRIPT_LEGACY "cbm-code-discovery-gate"
 /* Hard backstop in settings.json; the binary also self-bounds with an
  * in-process deadline well under this. */
 #define CMM_HOOK_TIMEOUT_SEC 5
@@ -2046,6 +2095,20 @@ int cbm_remove_claude_hooks(const char *settings_path) {
  * a missing/old/hung binary results in a silent exit 0 (issue #362/#288).
  * The legacy filename `cbm-code-discovery-gate` is retained so existing
  * settings.json entries and uninstall keep working with zero migration. */
+/* #929 (Windows): remove the pre-.cmd extensionless twin so upgrades stop
+ * triggering the Open-With dialog. POSIX keeps the extensionless name, where
+ * legacy == current — never unlink there. */
+static void cbm_remove_legacy_hook_script(const char *hooks_dir, const char *legacy_name) {
+#ifdef _WIN32
+    char legacy_path[CLI_BUF_1K];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/%s", hooks_dir, legacy_name);
+    cbm_unlink(legacy_path);
+#else
+    (void)hooks_dir;
+    (void)legacy_name;
+#endif
+}
+
 void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
     if (!home || !binary_path) {
         return;
@@ -2066,6 +2129,7 @@ void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
     snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
     cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
 
+    cbm_remove_legacy_hook_script(hooks_dir, CMM_HOOK_GATE_SCRIPT_LEGACY);
     char script_path[CLI_BUF_1K];
     snprintf(script_path, sizeof(script_path), "%s/" CMM_HOOK_GATE_SCRIPT, hooks_dir);
 
@@ -2073,6 +2137,17 @@ void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
     if (!f) {
         return;
     }
+#ifdef _WIN32
+    (void)fprintf(f,
+                  "@echo off\r\n"
+                  "REM codebase-memory-mcp search augmenter (Claude Code PreToolUse).\r\n"
+                  "REM Never blocks a tool call - it only adds graph context.\r\n"
+                  "REM Any failure is silent (exit 0, no output).\r\n"
+                  "if not exist \"%s\" exit /b 0\r\n"
+                  "\"%s\" hook-augment 2>NUL\r\n"
+                  "exit /b 0\r\n",
+                  binary_path, binary_path);
+#else
     (void)fprintf(f,
                   "#!/usr/bin/env bash\n"
                   "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
@@ -2084,6 +2159,7 @@ void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
                   "\"$BIN\" hook-augment 2>/dev/null\n"
                   "exit 0\n",
                   binary_path);
+#endif
     /* fchmod before close to avoid TOCTOU race (CodeQL cpp/toctou-race-condition) */
 #ifndef _WIN32
     fchmod(fileno(f), CLI_OCTAL_PERM);
@@ -2095,7 +2171,12 @@ void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
 }
 
 /* SessionStart hook: remind agent to use MCP tools on every context reset. */
+#ifdef _WIN32
+#define CMM_SESSION_REMINDER_SCRIPT "cbm-session-reminder.cmd"
+#else
 #define CMM_SESSION_REMINDER_SCRIPT "cbm-session-reminder"
+#endif
+#define CMM_SESSION_REMINDER_SCRIPT_LEGACY "cbm-session-reminder"
 
 static void cbm_install_session_reminder_script(const char *home) {
     if (!home) {
@@ -2110,6 +2191,7 @@ static void cbm_install_session_reminder_script(const char *home) {
     snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
     cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
 
+    cbm_remove_legacy_hook_script(hooks_dir, CMM_SESSION_REMINDER_SCRIPT_LEGACY);
     char script_path[CLI_BUF_1K];
     snprintf(script_path, sizeof(script_path), "%s/" CMM_SESSION_REMINDER_SCRIPT, hooks_dir);
 
@@ -2117,6 +2199,25 @@ static void cbm_install_session_reminder_script(const char *home) {
     if (!f) {
         return;
     }
+#ifdef _WIN32
+    /* cmd variant: echo per line; `|` must be caret-escaped in cmd. */
+    (void)fprintf(
+        f,
+        "@echo off\r\n"
+        "REM SessionStart hook: remind agent to use codebase-memory-mcp tools.\r\n"
+        "echo CRITICAL - Code Discovery Protocol:\r\n"
+        "echo 1. ALWAYS use codebase-memory-mcp tools FIRST for ANY code exploration:\r\n"
+        "echo    - search_graph(name_pattern/label/qn_pattern) to find functions/classes/routes\r\n"
+        "echo    - trace_path(function_name, mode=calls^|data_flow^|cross_service) for call "
+        "chains\r\n"
+        "echo    - get_code_snippet(qualified_name) for exact symbol source (precise ranges)\r\n"
+        "echo    - query_graph(query) for complex Cypher patterns\r\n"
+        "echo    - get_architecture(aspects) for project structure\r\n"
+        "echo    - search_code(pattern) for text search (graph-augmented grep)\r\n"
+        "echo 2. Use Grep/Glob/Read freely for text, configs, non-code files, and\r\n"
+        "echo    always Read a file before editing it.\r\n"
+        "echo 3. If a project is not indexed yet, run index_repository FIRST.\r\n");
+#else
     (void)fprintf(
         f, "#!/usr/bin/env bash\n"
            "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
@@ -2134,6 +2235,7 @@ static void cbm_install_session_reminder_script(const char *home) {
            "   always Read a file before editing it.\n"
            "3. If a project is not indexed yet, run index_repository FIRST.\n"
            "REMINDER\n");
+#endif
 #ifndef _WIN32
     fchmod(fileno(f), CLI_OCTAL_PERM);
 #endif
@@ -2180,7 +2282,12 @@ static int cbm_remove_session_hooks(const char *settings_path) {
  * The text is a leaner variant of the SessionStart protocol: it omits the
  * "run index_repository first" step, since the parent session has already
  * indexed the project. Matcher "*" fires for every agent type. */
+#ifdef _WIN32
+#define CMM_SUBAGENT_REMINDER_SCRIPT "cbm-subagent-reminder.cmd"
+#else
 #define CMM_SUBAGENT_REMINDER_SCRIPT "cbm-subagent-reminder"
+#endif
+#define CMM_SUBAGENT_REMINDER_SCRIPT_LEGACY "cbm-subagent-reminder"
 
 static void cbm_install_subagent_reminder_script(const char *home) {
     if (!home) {
@@ -2195,6 +2302,7 @@ static void cbm_install_subagent_reminder_script(const char *home) {
     snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
     cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
 
+    cbm_remove_legacy_hook_script(hooks_dir, CMM_SUBAGENT_REMINDER_SCRIPT_LEGACY);
     char script_path[CLI_BUF_1K];
     snprintf(script_path, sizeof(script_path), "%s/" CMM_SUBAGENT_REMINDER_SCRIPT, hooks_dir);
 
@@ -2205,6 +2313,17 @@ static void cbm_install_subagent_reminder_script(const char *home) {
     /* The additionalContext value is a single line with no embedded quotes,
      * backslashes, or newlines, so the JSON below is valid as written — no
      * runtime escaping (and no python3/jq dependency) is required. */
+#ifdef _WIN32
+    /* cmd variant: one echo with the JSON verbatim (quotes are literal in
+     * cmd echo; no cmd metacharacters appear in the payload). */
+    (void)fprintf(f, "@echo off\r\n"
+                     "REM SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\r\n"
+                     "echo {\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\","
+                     "\"additionalContext\":\"Code discovery: prefer codebase-memory-mcp tools "
+                     "(search_graph, trace_path, get_code_snippet, query_graph, get_architecture, "
+                     "search_code) over grep/file-read for navigating code. Use Grep/Glob/Read for "
+                     "text, configs, and non-code files.\"}}\r\n");
+#else
     (void)fprintf(f,
                   "#!/usr/bin/env bash\n"
                   "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
@@ -2217,6 +2336,7 @@ static void cbm_install_subagent_reminder_script(const char *home) {
                   "search_code) over grep/file-read for navigating code. Use Grep/Glob/Read for "
                   "text, configs, and non-code files.\"}}\n"
                   "REMINDER\n");
+#endif
 #ifndef _WIN32
     fchmod(fileno(f), CLI_OCTAL_PERM);
 #endif
@@ -3432,7 +3552,8 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         } else {
             printf("Aider:\n");
             if (!dry_run) {
-                cbm_upsert_instructions(ip, agent_instructions_content);
+                /* #1032: Aider cannot call MCP tools — CLI-form instructions. */
+                cbm_upsert_instructions(ip, aider_instructions_content);
             }
             printf("  instructions: %s\n", ip);
         }
@@ -4520,6 +4641,62 @@ static char *cli_heap_msgf(const char *fmt, const char *arg) {
     return cbm_strdup(buf);
 }
 
+/* Levenshtein distance for near-miss flag suggestions (two-row DP; inputs
+ * are schema property names, well under the buffer sizes used here). */
+static int cli_edit_distance(const char *a, const char *b) {
+    enum { CLI_ED_MAX = 128 };
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    if (la >= CLI_ED_MAX || lb >= CLI_ED_MAX) {
+        return CLI_ED_MAX;
+    }
+    int prev[CLI_ED_MAX + 1];
+    int cur[CLI_ED_MAX + 1];
+    for (size_t j = 0; j <= lb; j++) {
+        prev[j] = (int)j;
+    }
+    for (size_t i = 1; i <= la; i++) {
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= lb; j++) {
+            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            int del = prev[j] + 1;
+            int ins = cur[j - 1] + 1;
+            int sub = prev[j - 1] + cost;
+            int m = del < ins ? del : ins;
+            cur[j] = m < sub ? m : sub;
+        }
+        memcpy(prev, cur, (lb + 1) * sizeof(int));
+    }
+    return prev[lb];
+}
+
+/* Closest schema property to `key` for a "did you mean" suggestion, or NULL
+ * when nothing is plausibly near (distance > half the key length, min 2). */
+static const char *cli_closest_prop(yyjson_val *props, const char *key) {
+    const char *best = NULL;
+    int best_d = 0;
+    size_t idx;
+    size_t max;
+    yyjson_val *k;
+    yyjson_val *v;
+    yyjson_obj_foreach(props, idx, max, k, v) {
+        const char *name = yyjson_get_str(k);
+        if (!name) {
+            continue;
+        }
+        int d = cli_edit_distance(key, name);
+        if (!best || d < best_d) {
+            best = name;
+            best_d = d;
+        }
+    }
+    int limit = (int)(strlen(key) / 2);
+    if (limit < 2) {
+        limit = 2;
+    }
+    return (best && best_d <= limit) ? best : NULL;
+}
+
 /* True if the schema's required[] array contains `key`. */
 static bool cli_schema_required_has(yyjson_val *required, const char *key) {
     if (!required || !yyjson_is_arr(required)) {
@@ -4660,6 +4837,34 @@ char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char
 
         cli_kebab_to_snake(key);
         const char *type = cli_schema_type(props, key);
+
+        /* Unknown flag for a known tool: reject loudly (#997). Silently
+         * typing it as a string ships it as an ignored JSON arg — the
+         * server applies its default and the caller gets silently-wrong
+         * output (e.g. `trace_path --max-depth 1` traced at depth 3). */
+        if (props && !type) {
+            char kebab_key[CLI_BUF_256];
+            snprintf(kebab_key, sizeof(kebab_key), "%s", key);
+            cli_snake_to_kebab(kebab_key);
+            const char *close = cli_closest_prop(props, key);
+            char suggestion[CLI_BUF_256] = "";
+            if (close) {
+                char close_kebab[CLI_BUF_256];
+                snprintf(close_kebab, sizeof(close_kebab), "%s", close);
+                cli_snake_to_kebab(close_kebab);
+                snprintf(suggestion, sizeof(suggestion), " (did you mean --%s?)", close_kebab);
+            }
+            if (err_out) {
+                char buf[CLI_BUF_512];
+                snprintf(buf, sizeof(buf),
+                         "unknown flag --%s for this tool%s — run 'cli %s --help' for the "
+                         "supported flags",
+                         kebab_key, suggestion, tool_name);
+                *err_out = cbm_strdup(buf);
+            }
+            ok = false;
+            break;
+        }
 
         if (type && strcmp(type, "array") == 0 && !have_value) {
             if (err_out) {
