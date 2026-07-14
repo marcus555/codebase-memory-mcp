@@ -1111,10 +1111,11 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
 static bool db_internal_project_name(const char *full_path, char *name_out, size_t name_sz,
                                      cbm_store_t **out_store);
 
-/* #704 fallback: scan the cache dir for the db whose sole internal project name
- * equals `project`, returning an open store handle (caller owns it) or NULL.
- * Used only when <project>.db is absent or its internal name differs from the
- * passed name (drifted filename). Defined after is_project_db_file below. */
+/* #704 fallback: scan the cache dir for the db whose unambiguous primary project
+ * name equals `project`, returning an open store handle (caller owns it) or NULL.
+ * Auxiliary coverage projects are ignored. Used only when <project>.db is absent
+ * or its internal name differs from the passed name (drifted filename). Defined
+ * after is_project_db_file below. */
 static cbm_store_t *resolve_store_fallback_scan(const char *project);
 
 /* Open the right project's .db file for query tools.
@@ -1190,8 +1191,8 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     /* #704 fallback: either <project>.db is absent or its internal name drifted
      * from its filename. Node rows are keyed on the INTERNAL name (== the passed
      * name, since list_projects now advertises internal names), so scan the
-     * cache dir for the db whose sole internal project name equals `project` and
-     * adopt it. Runs ONLY on the fallback — the common fast path is unchanged.
+     * cache dir for the db whose unambiguous primary project name equals `project`
+     * and adopt it. Runs ONLY on the fallback — the common fast path is unchanged.
      * No match → NULL (a genuine typo stays not-found). */
     cbm_store_t *scanned = resolve_store_fallback_scan(project);
     if (scanned) {
@@ -1384,6 +1385,13 @@ static bool is_project_db_file(const char *name, size_t len) {
 }
 
 /* db_internal_project_name — see forward declaration above resolve_store. */
+static bool is_auxiliary_project_name(const char *name) {
+    static const char suffix[] = "::missed";
+    size_t name_len = name ? strlen(name) : 0;
+    size_t suffix_len = sizeof(suffix) - 1;
+    return name_len >= suffix_len && strcmp(name + name_len - suffix_len, suffix) == 0;
+}
+
 static bool db_internal_project_name(const char *full_path, char *name_out, size_t name_sz,
                                      cbm_store_t **out_store) {
     if (out_store) {
@@ -1396,10 +1404,23 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
     cbm_project_t *projs = NULL;
     int n = 0;
     bool ok = false;
-    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK && n == 1 && projs[0].name &&
-        projs[0].name[0]) {
-        snprintf(name_out, name_sz, "%s", projs[0].name);
-        ok = true;
+    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK) {
+        const char *primary_name = NULL;
+        for (int i = 0; i < n; i++) {
+            const char *candidate = projs[i].name;
+            if (!candidate || !candidate[0] || is_auxiliary_project_name(candidate)) {
+                continue;
+            }
+            if (primary_name) {
+                primary_name = NULL; /* multiple primary projects are ambiguous */
+                break;
+            }
+            primary_name = candidate;
+        }
+        if (primary_name) {
+            snprintf(name_out, name_sz, "%s", primary_name);
+            ok = true;
+        }
     }
     cbm_store_free_projects(projs, n);
     if (ok && out_store) {

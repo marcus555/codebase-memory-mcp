@@ -4122,6 +4122,93 @@ static bool issue704_make_db(const char *dir, const char *filename, const char *
     return ok;
 }
 
+static bool issue704_add_project(const char *dir, const char *filename, const char *internal) {
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", dir, filename);
+    cbm_store_t *st = cbm_store_open_path(path);
+    if (!st) {
+        return false;
+    }
+    bool ok = (cbm_store_upsert_project(st, internal, dir) == CBM_STORE_OK);
+    cbm_store_close(st);
+    return ok;
+}
+
+TEST(tool_list_projects_ignores_missed_coverage_projects) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-list-missed-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* Legacy database with exactly one primary project. */
+    ASSERT_TRUE(issue704_make_db(cache, "legacy.db", "legacy", "legacyFunc"));
+
+    /* Current coverage layout: one primary plus its internal miss graph. */
+    ASSERT_TRUE(issue704_make_db(cache, "covered.db", "covered", "coveredFunc"));
+    ASSERT_TRUE(issue704_add_project(cache, "covered.db", "covered::missed"));
+
+    /* Auxiliary-only and multi-primary databases must not be advertised. */
+    ASSERT_TRUE(issue704_add_project(cache, "only-missed.db", "only-missed::missed"));
+    ASSERT_TRUE(issue704_add_project(cache, "ambiguous.db", "ambiguous-a"));
+    ASSERT_TRUE(issue704_add_project(cache, "ambiguous.db", "ambiguous-b"));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    char *list = extract_text_content(resp);
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(strstr(list, "\"name\":\"legacy\""));
+    const char *covered = strstr(list, "\"name\":\"covered\"");
+    ASSERT_NOT_NULL(covered);
+    ASSERT_NULL(strstr(covered + 1, "\"name\":\"covered\""));
+    ASSERT_NULL(strstr(list, "::missed"));
+    ASSERT_NULL(strstr(list, "ambiguous-a"));
+    ASSERT_NULL(strstr(list, "ambiguous-b"));
+
+    char expected[700];
+    snprintf(expected, sizeof(expected),
+             "\"name\":\"covered\",\"root_path\":\"%s\",\"nodes\":1,\"edges\":0", cache);
+    ASSERT_NOT_NULL(strstr(list, expected));
+    free(list);
+    free(resp);
+
+    /* index_status must resolve the same primary project from this database. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"index_status\",\"arguments\":{\"project\":\"covered\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *status = extract_text_content(resp);
+    ASSERT_NOT_NULL(status);
+    ASSERT_NOT_NULL(strstr(status, "\"project\":\"covered\""));
+    ASSERT_NOT_NULL(strstr(status, "\"status\":\"ready\""));
+    ASSERT_NOT_NULL(strstr(status, cache));
+    free(status);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cleanup_project_db(cache, "legacy");
+    cleanup_project_db(cache, "covered");
+    cleanup_project_db(cache, "only-missed");
+    cleanup_project_db(cache, "ambiguous");
+    cbm_rmdir(cache);
+    PASS();
+}
+
 TEST(tool_resolve_store_by_internal_name_issue704) {
     char cache[256];
     snprintf(cache, sizeof(cache), "/tmp/cbm-issue704-XXXXXX");
@@ -5862,6 +5949,7 @@ SUITE(mcp) {
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
+    RUN_TEST(tool_list_projects_ignores_missed_coverage_projects);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
 
     /* auto_watch gate (distilled from PR #625) */
