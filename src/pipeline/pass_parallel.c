@@ -2274,10 +2274,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (lsp) {
             /* Canonicalise to the gbuf node's QN so res.qualified_name matches
              * the gbuf even when the cross-file fallback had to prefix the
-             * project name. If neither lookup hits, leave res.qualified_name
-             * empty — the LSP was confident but its target isn't in the gbuf
-             * (external/unindexed), so drop the edge rather than fall back to
-             * the registry resolver, matching prior single-lookup semantics. */
+             * project name. */
             lsp_target = cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
                                                       lsp->callee_qn, allow_tail);
             if (lsp_target) {
@@ -2287,7 +2284,19 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 res.candidate_count = 1;
                 ws->lsp_overrides++;
             }
-        } else {
+        }
+        /* #1085: fall back to the registry resolver whenever the LSP did not
+         * yield a gbuf-resolvable target — whether no LSP resolution existed,
+         * OR the LSP was confident but its callee_qn isn't a node in the gbuf
+         * (the JSX-via-tsconfig-alias case: the TS LSP resolves the element
+         * ref to an alias-path QN that never matches a def node, so lsp_target
+         * is NULL). The old `else` ran the registry ONLY when lsp was null, so
+         * an LSP-with-unresolvable-target dropped the edge outright — silently
+         * losing every alias-imported JSX component edge on the parallel path
+         * (~21% of a Next.js call graph) while the sequential pass, which falls
+         * THROUGH to the registry here, kept them. This restores seq/parallel
+         * parity via the import_map / unique_name resolution. */
+        if (!res.qualified_name || !res.qualified_name[0]) {
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
         }
