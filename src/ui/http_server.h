@@ -16,6 +16,13 @@
 typedef struct cbm_http_server cbm_http_server_t;
 struct cbm_watcher;
 
+/* Daemon-owned index boundary. The callback blocks until the coordinated
+ * operation finishes; the HTTP server runs it on a tracked, joinable thread. */
+typedef int (*cbm_http_index_executor_fn)(void *context, const char *root_path,
+                                          const char *project_name);
+typedef bool (*cbm_http_project_mutation_begin_fn)(void *context, const char *project);
+typedef void (*cbm_http_project_mutation_end_fn)(void *context, const char *project);
+
 /* Create an HTTP server on the given port.
  * Creates its own cbm_mcp_server_t with a separate read-only SQLite connection.
  * Returns NULL on failure (e.g. port in use). */
@@ -42,6 +49,18 @@ void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms);
 
 /* Set external watcher reference for UI project lifecycle actions. Not owned. */
 void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher);
+
+/* Route UI indexing through the daemon's shared operation registry. */
+void cbm_http_server_set_index_executor(cbm_http_server_t *srv,
+                                        cbm_http_index_executor_fn executor,
+                                        void *context);
+
+/* Route direct UI mutations and /rpc mutation tools through the daemon's
+ * per-project coordination gate. Direct UI calls are non-blocking: begin=false
+ * is returned to the browser as a retryable locked response. */
+void cbm_http_server_set_project_mutation_guard(
+    cbm_http_server_t *srv, cbm_http_project_mutation_begin_fn begin,
+    cbm_http_project_mutation_end_fn end, void *context);
 
 /* Initialize the log ring buffer mutex. Must be called once before any threads. */
 void cbm_ui_log_init(void);

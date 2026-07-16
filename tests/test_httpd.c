@@ -26,6 +26,7 @@
 #include <watcher/watcher.h>
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #ifndef _WIN32
@@ -431,6 +432,79 @@ static int th_server_start_with_watcher(th_server_t *ts, cbm_watcher_t *watcher)
     return 0;
 }
 
+typedef struct {
+    atomic_int calls;
+    char root_path[512];
+    char project_name[256];
+} th_ui_index_executor_t;
+
+static int th_ui_index_executor(void *opaque, const char *root_path,
+                                const char *project_name) {
+    th_ui_index_executor_t *executor = opaque;
+    snprintf(executor->root_path, sizeof(executor->root_path), "%s", root_path);
+    snprintf(executor->project_name, sizeof(executor->project_name), "%s",
+             project_name ? project_name : "");
+    atomic_fetch_add(&executor->calls, 1);
+    return 0;
+}
+
+static bool th_wait_atomic_int(atomic_int *value, int expected, uint32_t timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + timeout_ms;
+    while (cbm_now_ms() < deadline) {
+        if (atomic_load(value) == expected) {
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    return atomic_load(value) == expected;
+}
+
+typedef struct {
+    atomic_int begin_calls;
+    atomic_int end_calls;
+    bool allow;
+    char begin_project[256];
+    char end_project[256];
+} th_ui_mutation_guard_t;
+
+static void th_ui_mutation_guard_init(th_ui_mutation_guard_t *guard, bool allow) {
+    memset(guard, 0, sizeof(*guard));
+    atomic_init(&guard->begin_calls, 0);
+    atomic_init(&guard->end_calls, 0);
+    guard->allow = allow;
+}
+
+static bool th_ui_mutation_begin(void *opaque, const char *project) {
+    th_ui_mutation_guard_t *guard = opaque;
+    snprintf(guard->begin_project, sizeof(guard->begin_project), "%s",
+             project ? project : "");
+    atomic_fetch_add(&guard->begin_calls, 1);
+    return guard->allow;
+}
+
+static void th_ui_mutation_end(void *opaque, const char *project) {
+    th_ui_mutation_guard_t *guard = opaque;
+    snprintf(guard->end_project, sizeof(guard->end_project), "%s",
+             project ? project : "");
+    atomic_fetch_add(&guard->end_calls, 1);
+}
+
+static int th_server_start_with_mutation_guard(th_server_t *ts, cbm_watcher_t *watcher,
+                                               th_ui_mutation_guard_t *guard) {
+    ts->srv = cbm_http_server_new(0);
+    if (!ts->srv)
+        return -1;
+    if (watcher)
+        cbm_http_server_set_watcher(ts->srv, watcher);
+    cbm_http_server_set_project_mutation_guard(ts->srv, th_ui_mutation_begin,
+                                               th_ui_mutation_end, guard);
+    if (cbm_thread_create(&ts->tid, 0, th_server_thread, ts->srv) != 0) {
+        cbm_http_server_free(ts->srv);
+        return -1;
+    }
+    return 0;
+}
+
 static void th_server_stop(th_server_t *ts) {
     cbm_http_server_stop(ts->srv);
     cbm_thread_join(&ts->tid);
@@ -507,6 +581,65 @@ static int ui_delete_request(th_server_t *ts, const char *target, char *resp, si
     return th_http(cbm_http_server_port(ts->srv), req, resp, respsz);
 }
 
+static int ui_adr_post_request(th_server_t *ts, const char *project, const char *content,
+                               char *resp, size_t respsz) {
+    char body[2048];
+    int body_len = snprintf(body, sizeof(body),
+                            "{\"project\":\"%s\",\"content\":\"%s\"}", project,
+                            content);
+    if (body_len < 0 || (size_t)body_len >= sizeof(body))
+        return 0;
+
+    char req[2304];
+    int req_len = snprintf(req, sizeof(req),
+                           "POST /api/adr HTTP/1.1\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Content-Length: %d\r\n\r\n%s",
+                           body_len, body);
+    if (req_len < 0 || (size_t)req_len >= sizeof(req))
+        return 0;
+    return th_http(cbm_http_server_port(ts->srv), req, resp, respsz);
+}
+
+static int ui_adr_get_request(th_server_t *ts, const char *project, char *resp,
+                              size_t respsz) {
+    char req[512];
+    int req_len = snprintf(req, sizeof(req),
+                           "GET /api/adr?project=%s HTTP/1.1\r\n\r\n", project);
+    if (req_len < 0 || (size_t)req_len >= sizeof(req))
+        return 0;
+    return th_http(cbm_http_server_port(ts->srv), req, resp, respsz);
+}
+
+static int ui_adr_seed(const ui_delete_fixture_t *fx, const char *project,
+                       const char *content) {
+    char db_path[1024];
+    ui_delete_db_path(fx, project, db_path, sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store)
+        return CBM_STORE_ERR;
+    int rc = cbm_store_adr_store(store, project, content);
+    cbm_store_close(store);
+    return rc;
+}
+
+static bool ui_adr_equals(const ui_delete_fixture_t *fx, const char *project,
+                          const char *expected) {
+    char db_path[1024];
+    ui_delete_db_path(fx, project, db_path, sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (!store)
+        return false;
+
+    cbm_adr_t adr = {0};
+    int rc = cbm_store_adr_get(store, project, &adr);
+    bool equal = rc == CBM_STORE_OK && adr.content && strcmp(adr.content, expected) == 0;
+    if (rc == CBM_STORE_OK)
+        cbm_store_adr_free(&adr);
+    cbm_store_close(store);
+    return equal;
+}
+
 TEST(ui_server_unknown_path_404) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -521,6 +654,67 @@ TEST(ui_server_unknown_path_404) {
     ASSERT_NOT_NULL(strstr(resp, "Content-Length:"));
 
     th_server_stop(&ts);
+    PASS();
+}
+
+/* Security regression: process IDs are not cancellation capabilities. The UI
+ * must never expose an endpoint that accepts an arbitrary PID and reaches an
+ * OS process-termination API (the former Windows path accepted every PID but
+ * self). Daemon-owned jobs are cancelled by opaque, owner-bound subscription
+ * handles instead, so this legacy route must be completely absent. */
+TEST(ui_server_process_kill_route_is_unavailable) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+
+    static const char body[] = "{\"pid\":2147483646}";
+    char request[512];
+    snprintf(request, sizeof(request),
+             "POST /api/process-kill HTTP/1.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    char resp[4096];
+    int n = th_http(port, request, resp, sizeof(resp));
+
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 404);
+    ASSERT_NULL(strstr(resp, "\"killed\""));
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_routes_indexing_through_joinable_daemon_executor) {
+    char *root = th_mktempdir("cbm_httpd_daemon_index");
+    ASSERT_NOT_NULL(root);
+    th_ui_index_executor_t executor = {0};
+    atomic_init(&executor.calls, 0);
+    th_server_t ts;
+    ts.srv = cbm_http_server_new(0);
+    ASSERT_NOT_NULL(ts.srv);
+    cbm_http_server_set_index_executor(ts.srv, th_ui_index_executor, &executor);
+    ASSERT_EQ(cbm_thread_create(&ts.tid, 0, th_server_thread, ts.srv), 0);
+
+    char body[1024];
+    snprintf(body, sizeof(body),
+             "{\"root_path\":\"%s\",\"project_name\":\"ui-project\"}", root);
+    char request[1400];
+    snprintf(request, sizeof(request),
+             "POST /api/index HTTP/1.1\r\nContent-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    char response[4096];
+    int response_length = th_http(cbm_http_server_port(ts.srv), request,
+                                  response, sizeof(response));
+    bool called = th_wait_atomic_int(&executor.calls, 1, 2000);
+
+    th_server_stop(&ts);
+    ASSERT_GT(response_length, 0);
+    ASSERT_EQ(th_status(response), 202);
+    ASSERT_TRUE(called);
+    ASSERT_STR_EQ(executor.root_path, root);
+    ASSERT_STR_EQ(executor.project_name, "ui-project");
+    th_cleanup(root);
     PASS();
 }
 
@@ -647,6 +841,143 @@ TEST(ui_server_browse_traversal_probe) {
     ASSERT_NOT_NULL(json);
     ASSERT_EQ(json[4], '{');
     th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_adr_mutation_guard_busy_preserves_existing_adr) {
+    static const char *project = "ui-guard-adr-busy";
+    static const char *original = "original architecture";
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    ASSERT_EQ(ui_adr_seed(&fx, project, original), CBM_STORE_OK);
+
+    th_ui_mutation_guard_t guard;
+    th_ui_mutation_guard_init(&guard, false);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_mutation_guard(&ts, NULL, &guard), 0);
+
+    char resp[4096];
+    int n = ui_adr_post_request(&ts, project, "replacement architecture", resp,
+                                sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 423);
+    ASSERT_NOT_NULL(strstr(resp, "project is busy; retry after indexing"));
+    ASSERT_EQ(atomic_load(&guard.begin_calls), 1);
+    ASSERT_EQ(atomic_load(&guard.end_calls), 0);
+    ASSERT_STR_EQ(guard.begin_project, project);
+
+    /* A rejected mutation must leave the published DB queryable and unchanged.
+     * GET is a query operation and therefore must not enter the mutation guard. */
+    n = ui_adr_get_request(&ts, project, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"has_adr\":true"));
+    ASSERT_NOT_NULL(strstr(resp, original));
+    ASSERT_EQ(atomic_load(&guard.begin_calls), 1);
+    ASSERT_EQ(atomic_load(&guard.end_calls), 0);
+    ASSERT_TRUE(ui_adr_equals(&fx, project, original));
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_adr_mutation_guard_balances_success) {
+    static const char *project = "ui-guard-adr-success";
+    static const char *content = "coordinated architecture";
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+
+    th_ui_mutation_guard_t guard;
+    th_ui_mutation_guard_init(&guard, true);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_mutation_guard(&ts, NULL, &guard), 0);
+
+    char resp[4096];
+    int n = ui_adr_post_request(&ts, project, content, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "{\"saved\":true}"));
+    ASSERT_EQ(atomic_load(&guard.begin_calls), 1);
+    ASSERT_EQ(atomic_load(&guard.end_calls), 1);
+    ASSERT_STR_EQ(guard.begin_project, project);
+    ASSERT_STR_EQ(guard.end_project, project);
+    ASSERT_TRUE(ui_adr_equals(&fx, project, content));
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_mutation_guard_busy_preserves_project) {
+    static const char *project = "ui-guard-delete-busy";
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    ASSERT_EQ(ui_delete_make_db_file(&fx, project), 0);
+    ASSERT_EQ(ui_delete_make_sidecars(&fx, project), 0);
+    cbm_watcher_watch(fx.watcher, project, fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_ui_mutation_guard_t guard;
+    th_ui_mutation_guard_init(&guard, false);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_mutation_guard(&ts, fx.watcher, &guard), 0);
+
+    char resp[4096];
+    int n = ui_delete_request(&ts, "/api/project?name=ui-guard-delete-busy", resp,
+                              sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 423);
+    ASSERT_NOT_NULL(strstr(resp, "project is busy; retry after indexing"));
+    ASSERT_EQ(atomic_load(&guard.begin_calls), 1);
+    ASSERT_EQ(atomic_load(&guard.end_calls), 0);
+    ASSERT_STR_EQ(guard.begin_project, project);
+
+    char db_path[1024], wal_path[1040], shm_path[1040];
+    ui_delete_db_path(&fx, project, db_path, sizeof(db_path));
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+    ASSERT_TRUE(cbm_file_exists(db_path));
+    ASSERT_TRUE(cbm_file_exists(wal_path));
+    ASSERT_TRUE(cbm_file_exists(shm_path));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_mutation_guard_balances_success) {
+    static const char *project = "ui-guard-delete-success";
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    ASSERT_EQ(ui_delete_make_db_file(&fx, project), 0);
+    cbm_watcher_watch(fx.watcher, project, fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_ui_mutation_guard_t guard;
+    th_ui_mutation_guard_init(&guard, true);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_mutation_guard(&ts, fx.watcher, &guard), 0);
+
+    char resp[4096];
+    int n = ui_delete_request(&ts, "/api/project?name=ui-guard-delete-success", resp,
+                              sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "{\"deleted\":true}"));
+    ASSERT_EQ(atomic_load(&guard.begin_calls), 1);
+    ASSERT_EQ(atomic_load(&guard.end_calls), 1);
+    ASSERT_STR_EQ(guard.begin_project, project);
+    ASSERT_STR_EQ(guard.end_project, project);
+
+    char db_path[1024];
+    ui_delete_db_path(&fx, project, db_path, sizeof(db_path));
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 0);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
     PASS();
 }
 
@@ -1199,6 +1530,8 @@ SUITE(httpd) {
     /* Full UI server */
     RUN_TEST(ui_server_rejects_non_loopback_host);
     RUN_TEST(ui_server_unknown_path_404);
+    RUN_TEST(ui_server_process_kill_route_is_unavailable);
+    RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_root_serves_stub_404);
     RUN_TEST(ui_server_cors_localhost_reflected);
     RUN_TEST(ui_server_cors_evil_origin_not_reflected);
@@ -1207,6 +1540,10 @@ SUITE(httpd) {
     RUN_TEST(ui_server_encoded_slash_not_routed);
     RUN_TEST(ui_server_nul_in_target_rejected);
     RUN_TEST(ui_server_browse_traversal_probe);
+    RUN_TEST(ui_server_adr_mutation_guard_busy_preserves_existing_adr);
+    RUN_TEST(ui_server_adr_mutation_guard_balances_success);
+    RUN_TEST(ui_server_delete_mutation_guard_busy_preserves_project);
+    RUN_TEST(ui_server_delete_mutation_guard_balances_success);
     RUN_TEST(ui_server_delete_project_unwatches_after_delete);
     RUN_TEST(ui_server_delete_project_unwatches_missing_db);
     RUN_TEST(ui_server_delete_project_no_watcher_still_deletes);

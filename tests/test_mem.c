@@ -464,6 +464,23 @@ TEST(resolve_budget_override_when_total_unknown) {
     PASS();
 }
 
+TEST(resolve_budget_worker_cap_preserves_lower_user_override) {
+    size_t total = 8192 * CBM_TEST_MB;
+    size_t worker_cap = 16 * CBM_TEST_MB;
+    cbm_mem_budget_t lower =
+        cbm_mem_resolve_budget_capped(total, 0.5, "8", worker_cap);
+    ASSERT_EQ(lower.budget, 8 * CBM_TEST_MB);
+    ASSERT_STR_EQ(lower.source, "CBM_MEM_BUDGET_MB");
+    ASSERT_FALSE(lower.hard_capped);
+
+    cbm_mem_budget_t capped =
+        cbm_mem_resolve_budget_capped(total, 0.5, "64", worker_cap);
+    ASSERT_EQ(capped.budget, worker_cap);
+    ASSERT_STR_EQ(capped.source, "daemon_worker_cap");
+    ASSERT_TRUE(capped.hard_capped);
+    PASS();
+}
+
 TEST(resolve_budget_invalid_override_falls_back) {
     /* Non-numeric, zero, negative, trailing-garbage, and ERANGE-overflow
      * overrides are all rejected (invalid=true) → fraction budget, source
@@ -1162,6 +1179,7 @@ SUITE(mem) {
     RUN_TEST(resolve_budget_override_wins);
     RUN_TEST(resolve_budget_override_clamped_to_total);
     RUN_TEST(resolve_budget_override_when_total_unknown);
+    RUN_TEST(resolve_budget_worker_cap_preserves_lower_user_override);
     RUN_TEST(resolve_budget_invalid_override_falls_back);
     RUN_TEST(resolve_budget_override_overflow_clamps_to_total);
     RUN_TEST(resolve_budget_override_overflow_total_unknown_caps);

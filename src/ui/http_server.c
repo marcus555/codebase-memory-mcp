@@ -127,30 +127,32 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
 /* ── Server state ─────────────────────────────────────────────── */
 
-struct cbm_http_server {
-    cbm_httpd_t *listener;
-    cbm_mcp_server_t *mcp;       /* own MCP server instance (read-only) */
-    struct cbm_watcher *watcher; /* external watcher ref (not owned) */
-    atomic_int stop_flag;
-    int port;
-    bool listener_ok;
-};
-
-/* ── Forward declarations for process-kill PID validation ──────── */
-
 #define MAX_INDEX_JOBS 4
 
 typedef struct {
+    cbm_http_server_t *server;
     char root_path[1024];
     char project_name[256];
     atomic_int status; /* 0=idle, 1=running, 2=done, 3=error */
     char error_msg[256];
-#ifndef _WIN32
-    pid_t child_pid; /* tracked for process-kill validation */
-#endif
+    cbm_thread_t thread;
+    bool thread_started;
 } index_job_t;
 
-static index_job_t g_index_jobs[MAX_INDEX_JOBS];
+struct cbm_http_server {
+    cbm_httpd_t *listener;
+    cbm_mcp_server_t *mcp;       /* own MCP server instance (read-only) */
+    struct cbm_watcher *watcher; /* external watcher ref (not owned) */
+    cbm_http_index_executor_fn index_executor;
+    void *index_executor_context;
+    cbm_http_project_mutation_begin_fn mutation_begin;
+    cbm_http_project_mutation_end_fn mutation_end;
+    void *mutation_context;
+    index_job_t index_jobs[MAX_INDEX_JOBS];
+    atomic_int stop_flag;
+    int port;
+    bool listener_ok;
+};
 
 /* ── Serve embedded asset ─────────────────────────────────────── */
 
@@ -309,7 +311,7 @@ static void handle_repo_info(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
     }
-    cbm_store_t *store = cbm_store_open_path(db_path);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
     if (!store) {
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
         return;
@@ -576,76 +578,6 @@ static void handle_processes(cbm_http_conn_t *c) {
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
 
-/* POST /api/process-kill — kill a process by PID */
-static void handle_process_kill(cbm_http_conn_t *c, const cbm_http_req_t *req) {
-    if (req->body_len == 0 || req->body_len > 256) {
-        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
-        return;
-    }
-
-    yyjson_doc *doc = yyjson_read(req->body, req->body_len, 0);
-    if (!doc) {
-        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid json\"}");
-        return;
-    }
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *v_pid = yyjson_obj_get(root, "pid");
-    if (!v_pid || !yyjson_is_int(v_pid)) {
-        yyjson_doc_free(doc);
-        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing pid\"}");
-        return;
-    }
-    int target_pid = (int)yyjson_get_int(v_pid);
-    yyjson_doc_free(doc);
-
-#ifdef _WIN32
-    if (target_pid == (int)_getpid()) {
-#else
-    if (target_pid == (int)getpid()) {
-#endif
-        cbm_http_replyf(c, 400, g_cors_json,
-                        "{\"error\":\"cannot kill self (use the UI server's own shutdown)\"}");
-        return;
-    }
-
-#ifndef _WIN32
-    /* Only allow killing PIDs that were spawned by this server (indexing jobs) */
-    {
-        bool pid_is_ours = false;
-        for (int i = 0; i < MAX_INDEX_JOBS; i++) {
-            if (atomic_load(&g_index_jobs[i].status) == 1 &&
-                g_index_jobs[i].child_pid == target_pid) {
-                pid_is_ours = true;
-                break;
-            }
-        }
-        if (!pid_is_ours) {
-            cbm_http_replyf(c, 403, g_cors_json,
-                            "{\"error\":\"can only kill server-spawned processes\"}");
-            return;
-        }
-    }
-#endif
-
-#ifdef _WIN32
-    HANDLE hproc = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)target_pid);
-    if (!hproc || !TerminateProcess(hproc, 1)) {
-        if (hproc)
-            CloseHandle(hproc);
-        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"kill failed\"}");
-        return;
-    }
-    CloseHandle(hproc);
-#else
-    if (kill(target_pid, SIGTERM) != 0) {
-        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"kill failed\"}");
-        return;
-    }
-#endif
-
-    cbm_http_replyf(c, 200, g_cors_json, "{\"killed\":%d}", target_pid);
-}
-
 /* ── Directory browser ────────────────────────────────────────── */
 
 #include <dirent.h>
@@ -775,7 +707,7 @@ static void handle_adr_get(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     char db_path[1024];
     db_path_for_project(name, db_path, sizeof(db_path));
 
-    cbm_store_t *store = cbm_store_open_path(db_path);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
     if (!store) {
         cbm_http_replyf(c, 200, g_cors_json, "{\"has_adr\":false}");
         return;
@@ -824,7 +756,8 @@ static void handle_adr_get(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 }
 
 /* POST /api/adr — save ADR content. Body: {"project":"...","content":"..."} */
-static void handle_adr_save(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+static void handle_adr_save(cbm_http_server_t *srv, cbm_http_conn_t *c,
+                            const cbm_http_req_t *req) {
     if (req->body_len == 0 || req->body_len > 16384) {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
         return;
@@ -848,18 +781,36 @@ static void handle_adr_save(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     const char *proj = yyjson_get_str(v_proj);
     const char *content = yyjson_get_str(v_content);
 
+    if (srv->mutation_begin &&
+        !srv->mutation_begin(srv->mutation_context, proj)) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 423, g_cors_json,
+                        "{\"error\":\"project is busy; retry after indexing\"}");
+        return;
+    }
+    bool mutation_held = srv->mutation_begin != NULL;
+
     char db_path[1024];
     db_path_for_project(proj, db_path, sizeof(db_path));
 
     cbm_store_t *store = cbm_store_open_path(db_path);
-    yyjson_doc_free(doc);
     if (!store) {
+        if (mutation_held) {
+            srv->mutation_end(srv->mutation_context, proj);
+        }
+        yyjson_doc_free(doc);
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
         return;
     }
 
     int rc = cbm_store_adr_store(store, proj, content);
     cbm_store_close(store);
+    if (mutation_held) {
+        srv->mutation_end(srv->mutation_context, proj);
+    }
+    /* proj/content are owned by doc; keep it alive through both SQLite and
+     * the mutation-end callback. */
+    yyjson_doc_free(doc);
 
     if (rc == CBM_STORE_OK) {
         cbm_http_replyf(c, 200, g_cors_json, "{\"saved\":true}");
@@ -976,182 +927,37 @@ void cbm_http_server_set_binary_path(const char *path) {
     }
 }
 
-/* Index via subprocess — isolates crashes from the main process. */
+/* Execute through the daemon's shared job registry. The thread is retained in
+ * its slot and joined before reuse/free; no detached operation can outlive the
+ * daemon application that owns its callback context. */
 static void *index_thread_fn(void *arg) {
     index_job_t *job = arg;
     cbm_log_info("ui.index.start", "path", job->root_path);
-
-    /* Use stored binary path, or try to find it */
-    const char *bin = g_binary_path;
-    char self_path[1024] = {0};
-    if (!bin[0]) {
-        cbm_http_server_resolve_binary_path(NULL, self_path, sizeof(self_path));
-        bin = self_path[0] ? self_path : "codebase-memory-mcp";
-    }
-
-    char log_file[256];
-
-    /* JSON-escape root_path and optional project name. */
-    char escaped_path[2048];
-    cbm_json_escape(escaped_path, (int)sizeof(escaped_path), job->root_path);
-    char escaped_name[512];
-    cbm_json_escape(escaped_name, (int)sizeof(escaped_name), job->project_name);
-    char json_arg[4096];
-    if (job->project_name[0]) {
-        snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\",\"name\":\"%s\"}", escaped_path,
-                 escaped_name);
-    } else {
-        snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\"}", escaped_path);
-    }
-
-#ifdef _WIN32
-    snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d.log",
-             getenv("TEMP") ? getenv("TEMP") : ".", (int)_getpid());
-
-    /* Build command line for CreateProcess through the shared MS-CRT quoter so the
-     * JSON arg's embedded quotes survive the child's argv re-parse — a naive
-     * `"%s"` wrap dropped them, corrupting {"repo_path":"…"} into {repo_path:…}.
-     * --index-worker: this http_server spawn is already the crash-isolation layer,
-     * so the child runs indexing in-process rather than spawning its own supervisor
-     * (avoids redundant process nesting). */
-    char cmdline[2048];
-    const char *const idx_argv[] = {bin,      "cli", "--index-worker", "index_repository",
-                                    json_arg, NULL};
-    if (!cbm_build_win_cmdline(cmdline, sizeof(cmdline), idx_argv)) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "index command line too long");
-        atomic_store(&job->status, 3);
-        return NULL;
-    }
-    /* Wide command line: CreateProcessA would re-mangle the UTF-8 repo path through the
-     * ANSI code page at the spawn boundary, so a non-ASCII repo path never reaches the
-     * worker intact (#423/#20). Convert and spawn via CreateProcessW. */
-    wchar_t *wcmd = cbm_utf8_to_wide(cmdline);
-    if (!wcmd) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "index command line conversion failed");
-        atomic_store(&job->status, 3);
-        return NULL;
-    }
-
-    cbm_log_info("ui.index.spawn", "bin", bin, "log", log_file);
-
-    HANDLE hlog = CreateFileA(log_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, NULL);
-    STARTUPINFOW si_proc = {.cb = sizeof(si_proc)};
-    if (hlog != INVALID_HANDLE_VALUE) {
-        si_proc.dwFlags = STARTF_USESTDHANDLES;
-        si_proc.hStdError = hlog;
-        si_proc.hStdOutput = hlog;
-    }
-    PROCESS_INFORMATION pi = {0};
-    BOOL spawned = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, 0, NULL, NULL, &si_proc, &pi);
-    free(wcmd);
-    if (!spawned) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "CreateProcess failed");
-        atomic_store(&job->status, 3);
-        if (hlog != INVALID_HANDLE_VALUE)
-            CloseHandle(hlog);
-        return NULL;
-    }
-    if (hlog != INVALID_HANDLE_VALUE)
-        CloseHandle(hlog);
-
-    /* Poll log file while child runs */
-    long tail_pos = 0;
-    for (;;) {
-        DWORD wait = WaitForSingleObject(pi.hProcess, 500);
-        FILE *lf = fopen(log_file, "r");
-        if (lf) {
-            fseek(lf, tail_pos, SEEK_SET);
-            char line[512];
-            while (fgets(line, sizeof(line), lf)) {
-                size_t l = strlen(line);
-                if (l > 0 && line[l - 1] == '\n')
-                    line[l - 1] = '\0';
-                if (line[0])
-                    cbm_ui_log_append(line);
-            }
-            tail_pos = ftell(lf);
-            fclose(lf);
-        }
-        if (wait == WAIT_OBJECT_0)
-            break;
-    }
-
-    DWORD win_exit = 1;
-    GetExitCodeProcess(pi.hProcess, &win_exit);
-    int exit_code = (int)win_exit;
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    (void)DeleteFileA(log_file);
-#else
-    snprintf(log_file, sizeof(log_file), "/tmp/cbm_index_%d.log", (int)getpid());
-
-    cbm_log_info("ui.index.fork", "bin", bin, "log", log_file);
-
-    pid_t child_pid = fork();
-    if (child_pid < 0) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "fork failed");
-        atomic_store(&job->status, 3);
-        return NULL;
-    }
-    job->child_pid = child_pid;
-
-    if (child_pid == 0) {
-        FILE *lf = freopen(log_file, "w", stderr);
-        (void)lf;
-        freopen("/dev/null", "w", stdout);
-        execl(bin, bin, "cli", "--index-worker", "index_repository", json_arg, (char *)NULL);
-        _exit(127);
-    }
-
-    long tail_pos = 0;
-    for (;;) {
-        int wstatus = 0;
-        pid_t wr = waitpid(child_pid, &wstatus, WNOHANG);
-        bool child_done = (wr == child_pid);
-
-        FILE *lf = fopen(log_file, "r");
-        if (lf) {
-            fseek(lf, tail_pos, SEEK_SET);
-            char line[512];
-            while (fgets(line, sizeof(line), lf)) {
-                size_t l = strlen(line);
-                if (l > 0 && line[l - 1] == '\n')
-                    line[l - 1] = '\0';
-                if (line[0])
-                    cbm_ui_log_append(line);
-            }
-            tail_pos = ftell(lf);
-            fclose(lf);
-        }
-
-        if (child_done)
-            break;
-
-        struct timespec ts = {0, 500000000};
-        cbm_nanosleep(&ts, NULL);
-    }
-
-    int wstatus = 0;
-    waitpid(child_pid, &wstatus, 0);
-    int exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
-
-    (void)unlink(log_file);
-#endif
-
-    if (exit_code != 0) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "indexing failed (exit code %d)",
-                 exit_code);
+    cbm_http_server_t *server = job->server;
+    int result = server && server->index_executor
+                     ? server->index_executor(server->index_executor_context,
+                                              job->root_path, job->project_name)
+                     : -1;
+    if (result != 0) {
+        snprintf(job->error_msg, sizeof(job->error_msg),
+                 "daemon index operation failed");
         atomic_store(&job->status, 3);
     } else {
         atomic_store(&job->status, 2);
     }
-    cbm_log_info("ui.index.done", "path", job->root_path, "rc", exit_code == 0 ? "ok" : "err");
+    cbm_log_info("ui.index.done", "path", job->root_path, "rc",
+                 result == 0 ? "ok" : "err");
     return NULL;
 }
 
 /* POST /api/index — body: {"root_path": "/abs/path", "project_name": "..."} */
-static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
+                               const cbm_http_req_t *req) {
+    if (!server || !server->index_executor) {
+        cbm_http_replyf(c, 503, g_cors_json,
+                        "{\"error\":\"daemon index coordinator unavailable\"}");
+        return;
+    }
     if (req->body_len == 0 || req->body_len > 4096) {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
         return;
@@ -1183,7 +989,7 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     /* Find free job slot */
     int slot = -1;
     for (int i = 0; i < MAX_INDEX_JOBS; i++) {
-        int st = atomic_load(&g_index_jobs[i].status);
+        int st = atomic_load(&server->index_jobs[i].status);
         if (st == 0 || st == 2 || st == 3) {
             slot = i;
             break;
@@ -1195,7 +1001,12 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    index_job_t *job = &g_index_jobs[slot];
+    index_job_t *job = &server->index_jobs[slot];
+    if (job->thread_started) {
+        (void)cbm_thread_join(&job->thread);
+        job->thread_started = false;
+    }
+    job->server = server;
     snprintf(job->root_path, sizeof(job->root_path), "%s", rpath);
     snprintf(job->project_name, sizeof(job->project_name), "%s", project_name);
     job->error_msg[0] = '\0';
@@ -1203,25 +1014,24 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     yyjson_doc_free(doc);
 
     /* Spawn background thread */
-    cbm_thread_t tid;
-    if (cbm_thread_create(&tid, 0, index_thread_fn, job) != 0) {
+    if (cbm_thread_create(&job->thread, 0, index_thread_fn, job) != 0) {
         atomic_store(&job->status, 3);
         snprintf(job->error_msg, sizeof(job->error_msg), "thread creation failed");
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"thread creation failed\"}");
         return;
     }
-    cbm_thread_detach(&tid); /* Don't leak thread handle */
+    job->thread_started = true;
 
     cbm_http_replyf(c, 202, g_cors_json, "{\"status\":\"indexing\",\"slot\":%d,\"path\":\"%s\"}",
                     slot, job->root_path);
 }
 
 /* GET /api/index-status — returns status of all index jobs */
-static void handle_index_status(cbm_http_conn_t *c) {
+static void handle_index_status(cbm_http_server_t *server, cbm_http_conn_t *c) {
     char buf[2048] = "[";
     int pos = 1;
     for (int i = 0; i < MAX_INDEX_JOBS; i++) {
-        int st = atomic_load(&g_index_jobs[i].status);
+        int st = atomic_load(&server->index_jobs[i].status);
         if (st == 0)
             continue;
         if (pos > 1)
@@ -1229,7 +1039,8 @@ static void handle_index_status(cbm_http_conn_t *c) {
         const char *ss = st == 1 ? "indexing" : st == 2 ? "done" : "error";
         http_appendf(buf, sizeof(buf), &pos,
                      "{\"slot\":%d,\"status\":\"%s\",\"path\":\"%s\",\"error\":\"%s\"}", i, ss,
-                     g_index_jobs[i].root_path, st == 3 ? g_index_jobs[i].error_msg : "");
+                     server->index_jobs[i].root_path,
+                     st == 3 ? server->index_jobs[i].error_msg : "");
     }
     buf[pos++] = ']';
     buf[pos] = '\0';
@@ -1258,11 +1069,25 @@ static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
+    if (srv->mutation_begin &&
+        !srv->mutation_begin(srv->mutation_context, name)) {
+        cbm_http_replyf(c, 423, g_cors_json,
+                        "{\"error\":\"project is busy; retry after indexing\"}");
+        return;
+    }
+    bool mutation_held = srv->mutation_begin != NULL;
+
     if (unlink(db_path) != 0) {
         if (errno == ENOENT) {
             unwatch_project(srv, name);
+            if (mutation_held) {
+                srv->mutation_end(srv->mutation_context, name);
+            }
             cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
             return;
+        }
+        if (mutation_held) {
+            srv->mutation_end(srv->mutation_context, name);
         }
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"failed to delete\"}");
         return;
@@ -1277,6 +1102,9 @@ static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
     unwatch_project(srv, name);
     cbm_log_info("ui.project.deleted", "name", name);
+    if (mutation_held) {
+        srv->mutation_end(srv->mutation_context, name);
+    }
     cbm_http_replyf(c, 200, g_cors_json, "{\"deleted\":true}");
 }
 
@@ -1296,7 +1124,7 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req)
         return;
     }
 
-    cbm_store_t *store = cbm_store_open_path(db_path);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
     if (!store) {
         cbm_http_replyf(c, 200, g_cors_json, "{\"status\":\"corrupt\",\"reason\":\"cannot open\"}");
         return;
@@ -1470,7 +1298,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    cbm_store_t *store = cbm_store_open_path(db_path);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
     if (!store) {
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
         return;
@@ -1539,7 +1367,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             continue;
         }
 
-        cbm_store_t *lp_store = cbm_store_open_path(lp_path);
+        cbm_store_t *lp_store = cbm_store_open_path_query(lp_path);
         if (!lp_store) {
             free(linked[li]);
             continue;
@@ -1761,13 +1589,13 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
     /* POST /api/index → start background indexing */
     if (is_post && cbm_http_path_match(req->path, "/api/index")) {
-        handle_index_start(c, req);
+        handle_index_start(srv, c, req);
         return;
     }
 
     /* GET /api/index-status → check indexing progress */
     if (is_get && cbm_http_path_match(req->path, "/api/index-status")) {
-        handle_index_status(c);
+        handle_index_status(srv, c);
         return;
     }
 
@@ -1797,7 +1625,7 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
     /* POST /api/adr → save ADR for project */
     if (is_post && cbm_http_path_match(req->path, "/api/adr")) {
-        handle_adr_save(c, req);
+        handle_adr_save(srv, c, req);
         return;
     }
 
@@ -1816,12 +1644,6 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* GET /api/logs → recent log lines */
     if (is_get && cbm_http_path_match(req->path, "/api/logs*")) {
         handle_logs(c, req);
-        return;
-    }
-
-    /* POST /api/process-kill → kill a process */
-    if (is_post && cbm_http_path_match(req->path, "/api/process-kill")) {
-        handle_process_kill(c, req);
         return;
     }
 
@@ -1848,6 +1670,15 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
 /* ── Public API ───────────────────────────────────────────────── */
 
+static char *http_read_only_index_rejected(void *context, const char *repo_path,
+                                           const char *args_json) {
+    (void)context;
+    (void)repo_path;
+    (void)args_json;
+    return cbm_mcp_text_result(
+        "UI RPC indexing is disabled; use the coordinated /api/index route", true);
+}
+
 cbm_http_server_t *cbm_http_server_new(int port) {
     cbm_http_server_t *srv = calloc(1, sizeof(*srv));
     if (!srv)
@@ -1863,6 +1694,9 @@ cbm_http_server_t *cbm_http_server_new(int port) {
         free(srv);
         return NULL;
     }
+    cbm_mcp_server_set_background_tasks(srv->mcp, false);
+    cbm_mcp_server_set_index_executor(srv->mcp,
+                                      http_read_only_index_rejected, srv);
 
     /* Bind to localhost only (httpd refuses anything else by construction) */
     srv->listener = cbm_httpd_listen(port);
@@ -1891,6 +1725,12 @@ cbm_http_server_t *cbm_http_server_new(int port) {
 void cbm_http_server_free(cbm_http_server_t *srv) {
     if (!srv)
         return;
+    for (int i = 0; i < MAX_INDEX_JOBS; i++) {
+        if (srv->index_jobs[i].thread_started) {
+            (void)cbm_thread_join(&srv->index_jobs[i].thread);
+            srv->index_jobs[i].thread_started = false;
+        }
+    }
     cbm_httpd_close(srv->listener);
     cbm_mcp_server_free(srv->mcp);
     free(srv);
@@ -1950,4 +1790,26 @@ void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *wat
     if (srv) {
         srv->watcher = watcher;
     }
+}
+
+void cbm_http_server_set_index_executor(cbm_http_server_t *srv,
+                                        cbm_http_index_executor_fn executor,
+                                        void *context) {
+    if (srv) {
+        srv->index_executor = executor;
+        srv->index_executor_context = context;
+    }
+}
+
+void cbm_http_server_set_project_mutation_guard(
+    cbm_http_server_t *srv, cbm_http_project_mutation_begin_fn begin,
+    cbm_http_project_mutation_end_fn end, void *context) {
+    if (!srv || ((begin == NULL) != (end == NULL))) {
+        return;
+    }
+    srv->mutation_begin = begin;
+    srv->mutation_end = end;
+    srv->mutation_context = begin ? context : NULL;
+    cbm_mcp_server_set_project_mutation_guard(srv->mcp, begin, end,
+                                              begin ? context : NULL);
 }

@@ -802,13 +802,14 @@ int cbm_exec_no_shell(const char *const *argv) {
 
 #endif /* _WIN32 */
 
-/* Canonicalize an EXISTING path (collapse `..`, resolve per-OS): realpath on
- * POSIX; on Windows a wide-path GetFileAttributesW existence check +
- * GetFullPathNameW. The previous callers used the ANSI CRT (_access/
- * _fullpath) on UTF-8 input — locale-dependent by construction: on a CJK
- * system codepage (e.g. Big5) the UTF-8 bytes of a CJK path re-decode into
- * different characters and canonicalization corrupts the path (#973).
- * Returns 0 when the path does not exist or cannot be resolved. */
+/* Canonicalize an EXISTING path (collapse `..`, resolve links/junctions):
+ * realpath on POSIX; a final path queried from an opened handle on Windows.
+ * The previous Windows callers used the ANSI CRT (_access/_fullpath) on UTF-8
+ * input — locale-dependent by construction: on a CJK system codepage (e.g.
+ * Big5) the UTF-8 bytes of a CJK path re-decode into different characters and
+ * canonicalization corrupts the path (#973).  GetFullPathNameW alone is also
+ * only lexical and would let an allowed-root check follow a junction outside
+ * the root.  Returns 0 when the path does not exist or cannot be resolved. */
 int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
     if (!path || !out || out_sz == 0) {
         return 0;
@@ -818,18 +819,46 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
     if (!wpath) {
         return 0;
     }
-    if (GetFileAttributesW(wpath) == INVALID_FILE_ATTRIBUTES) {
-        free(wpath);
+    HANDLE handle = CreateFileW(wpath, FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(wpath);
+    if (handle == INVALID_HANDLE_VALUE) {
         return 0;
     }
-    enum { CANON_WIDE_MAX = 4096 };
-    wchar_t wfull[CANON_WIDE_MAX];
-    DWORD n = GetFullPathNameW(wpath, CANON_WIDE_MAX, wfull, NULL);
-    free(wpath);
-    if (n == 0 || n >= CANON_WIDE_MAX) {
+    DWORD needed =
+        GetFinalPathNameByHandleW(handle, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (needed == 0 || needed == MAXDWORD || (size_t)needed > SIZE_MAX / sizeof(wchar_t) - 1) {
+        (void)CloseHandle(handle);
         return 0;
+    }
+    size_t capacity = (size_t)needed + 1;
+    wchar_t *wfull = calloc(capacity, sizeof(*wfull));
+    if (!wfull) {
+        (void)CloseHandle(handle);
+        return 0;
+    }
+    DWORD n = GetFinalPathNameByHandleW(handle, wfull, (DWORD)capacity,
+                                        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    (void)CloseHandle(handle);
+    if (n == 0 || (size_t)n >= capacity) {
+        free(wfull);
+        return 0;
+    }
+
+    /* Preserve the conventional DOS/UNC form returned by the old API while
+     * retaining the handle-based resolution. */
+    if (wcsncmp(wfull, L"\\\\?\\UNC\\", 8) == 0) {
+        size_t tail_length = wcslen(wfull + 8);
+        wmemmove(wfull + 2, wfull + 8, tail_length + 1);
+        wfull[0] = L'\\';
+        wfull[1] = L'\\';
+    } else if (wcsncmp(wfull, L"\\\\?\\", 4) == 0) {
+        size_t tail_length = wcslen(wfull + 4);
+        wmemmove(wfull, wfull + 4, tail_length + 1);
     }
     char *utf8 = cbm_wide_to_utf8(wfull);
+    free(wfull);
     if (!utf8) {
         return 0;
     }
@@ -859,7 +888,7 @@ int cbm_rename_replace(const char *src, const char *dst) {
     if (wsrc && wdst) {
         ret =
             MoveFileExW(wsrc, wdst,
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
                 ? 0
                 : CBM_NOT_FOUND;
     }
@@ -871,23 +900,54 @@ int cbm_rename_replace(const char *src, const char *dst) {
 #endif
 }
 
-/* Remove a SQLite database's -wal/-shm sidecars (both platforms). Any code
- * path that installs a FRESH database file where a previous generation lived
- * must remove them before the new generation can be opened: SQLite decides
- * whether to replay a WAL purely from the sidecar's own header/checksums, so
- * a leftover WAL can splice old-generation pages into the new file (#897). */
-void cbm_remove_db_sidecars(const char *db_path) {
+/* Remove a SQLite database's -wal/-shm/-journal sidecars (both platforms). Any code
+ * path that installs a FRESH database file at a path where a previous
+ * generation lived must call this first: SQLite decides whether to replay a
+ * WAL purely from the sidecar's own header/checksums, so a leftover WAL
+ * from a crashed session is recovered ON TOP of the freshly installed file
+ * at the next open, splicing old-generation pages into it (#897). */
+int cbm_remove_db_sidecars(const char *db_path) {
     if (!db_path || !db_path[0]) {
-        return;
+        return CBM_NOT_FOUND;
     }
     enum { SIDECAR_PATH_MAX = 4096 };
     char side[SIDECAR_PATH_MAX];
+    /* Validate the longest suffix before unlinking anything. Otherwise a
+     * near-limit path can remove -wal/-shm, silently skip a truncated
+     * -journal, and report success after partially mutating the generation. */
+    if (strlen(db_path) > sizeof(side) - sizeof("-journal")) {
+        return CBM_NOT_FOUND;
+    }
+    int result = 0;
     int n = snprintf(side, sizeof(side), "%s-wal", db_path);
-    if (n > 0 && (size_t)n < sizeof(side)) {
-        (void)cbm_unlink(side);
+    if (n <= 0 || (size_t)n >= sizeof(side)) {
+        return CBM_NOT_FOUND;
+    }
+    errno = 0;
+    int unlink_rc = cbm_unlink(side);
+    int unlink_error = errno;
+    if (unlink_rc != 0 && unlink_error != ENOENT) {
+        result = CBM_NOT_FOUND;
     }
     n = snprintf(side, sizeof(side), "%s-shm", db_path);
-    if (n > 0 && (size_t)n < sizeof(side)) {
-        (void)cbm_unlink(side);
+    if (n <= 0 || (size_t)n >= sizeof(side)) {
+        return CBM_NOT_FOUND;
     }
+    errno = 0;
+    unlink_rc = cbm_unlink(side);
+    unlink_error = errno;
+    if (unlink_rc != 0 && unlink_error != ENOENT) {
+        result = CBM_NOT_FOUND;
+    }
+    n = snprintf(side, sizeof(side), "%s-journal", db_path);
+    if (n <= 0 || (size_t)n >= sizeof(side)) {
+        return CBM_NOT_FOUND;
+    }
+    errno = 0;
+    unlink_rc = cbm_unlink(side);
+    unlink_error = errno;
+    if (unlink_rc != 0 && unlink_error != ENOENT) {
+        result = CBM_NOT_FOUND;
+    }
+    return result;
 }

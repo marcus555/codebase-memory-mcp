@@ -13,6 +13,9 @@ int tf_skip_count = 0;
 #include "foundation/compat.h"    /* cbm_setenv — #845 supervisor kill switch */
 #include "foundation/compat_fs.h" /* cbm_fopen — worker response file */
 #include "foundation/mem.h"       /* cbm_mem_init — worker budget */
+#include "daemon/runtime.h"       /* bounded worker response probe */
+#include "daemon/ipc.h"           /* Windows private-lock re-exec probe */
+#include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
 #include "mcp/index_supervisor.h" /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"              /* cbm_mcp_handle_tool — act as a real worker */
 #include <sqlite3.h>
@@ -21,8 +24,15 @@ int tf_skip_count = 0;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #ifdef _WIN32
 #include <winsock2.h> /* #798 follow-up: socket-isolation re-exec probe */
+#else
+#include <unistd.h>
+#ifdef __APPLE__
+#include <fcntl.h>
+#include <sys/mman.h>
+#endif
 #endif
 
 /* Test handlers that exercise the production index_repository flow must never
@@ -51,48 +61,102 @@ static bool tf_setup_cache_sentinel(void) {
     return true;
 }
 
-/* #832 guard support: when the index supervisor spawns THIS binary as
- * `<self> cli --index-worker index_repository <args_json> --response-out <file>`
- * (exactly the argv cbm_index_spawn_worker builds), act as a faithful in-process
- * index worker instead of re-running the test suites. This lets the deterministic
+/* Fast real-process probes for the async index-supervisor contract. They run
+ * only in a child admitted by the exact build-bound worker grammar. */
+static void tf_index_worker_probe(const char *args_json, const char *response_out) {
+    if (!args_json || !strstr(args_json, "\"__cbm_test_worker\"")) {
+        return;
+    }
+    if (strstr(args_json, "\"clean\"")) {
+        FILE *response = response_out ? cbm_fopen(response_out, "wb") : NULL;
+        if (response) {
+            (void)fputs("{\"probe\":\"clean\"}", response);
+            (void)fclose(response);
+        }
+        (void)fprintf(stderr, "async worker clean probe\n");
+        fflush(NULL);
+        _Exit(response ? 0 : 1);
+    }
+    if (strstr(args_json, "\"crash\"")) {
+        (void)fprintf(stderr, "async worker crash probe\n");
+        fflush(NULL);
+        abort();
+    }
+    if (strstr(args_json, "\"oversize\"")) {
+        FILE *response = response_out ? cbm_fopen(response_out, "wb") : NULL;
+        bool written = false;
+        if (response) {
+            written = fseek(response, (long)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX,
+                            SEEK_SET) == 0 &&
+                      fputc('x', response) != EOF;
+            written = fclose(response) == 0 && written;
+        }
+        (void)fprintf(stderr, "async worker oversized response probe\n");
+        fflush(NULL);
+        _Exit(written ? 0 : 1);
+    }
+    if (strstr(args_json, "\"hang-tree\"")) {
+        (void)signal(SIGTERM, SIG_IGN);
+        long descendant = 0;
+#ifndef _WIN32
+        pid_t child = fork();
+        if (child == 0) {
+            for (;;) {
+                cbm_usleep(100000);
+            }
+        }
+        if (child > 0) {
+            descendant = (long)child;
+        }
+#endif
+        const char *marker = getenv("CBM_INDEX_MARKER_FILE");
+        FILE *ready = marker ? cbm_fopen(marker, "wb") : NULL;
+        if (ready) {
+            (void)fprintf(
+                ready, "single=%s\nmarker=%s\nquarantine=%s\nbudget=%zu\ndescendant=%ld\n",
+                getenv("CBM_INDEX_SINGLE_THREAD") ? getenv("CBM_INDEX_SINGLE_THREAD") : "", marker,
+                getenv("CBM_INDEX_QUARANTINE_FILE") ? getenv("CBM_INDEX_QUARANTINE_FILE") : "",
+                cbm_mem_budget(), descendant);
+            (void)fclose(ready);
+        }
+        (void)fprintf(stderr, "async worker hang-tree probe\n");
+        fflush(NULL);
+        for (;;) {
+            cbm_usleep(100000);
+        }
+    }
+}
+
+/* #832 guard support: when the index supervisor spawns THIS binary with the
+ * exact build-bound worker grammar produced by cbm_index_worker_start(), act
+ * as a faithful in-process index worker instead of re-running the test suites.
+ * This lets the deterministic
  * gating guard (test_mcp.c) spawn a REAL worker child that indexes the fixture and
  * writes its response back, using only public APIs — no production test seam.
  * Returns an exit code (>=0) when it handled a worker invocation, else -1. */
 static int tf_maybe_run_index_worker(int argc, char **argv) {
-    if (argc < 2 || strcmp(argv[1], "cli") != 0) {
+    cbm_index_worker_invocation_t invocation;
+    cbm_index_worker_argv_status_t status =
+        cbm_index_worker_parse_process_argv(argc, argv, &invocation);
+    if (status == CBM_INDEX_WORKER_ARGV_NOT_WORKER) {
         return -1;
     }
-    bool is_worker = false;
-    const char *tool = NULL;
-    const char *args_json = "{}";
-    const char *response_out = NULL;
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--index-worker") == 0) {
-            is_worker = true;
-        } else if (strcmp(argv[i], "--response-out") == 0) {
-            if (i + 1 < argc) {
-                response_out = argv[++i];
-            }
-        } else if (argv[i][0] == '{') {
-            args_json = argv[i];
-        } else if (argv[i][0] != '-' && !tool) {
-            tool = argv[i];
-        }
-    }
-    if (!is_worker) {
-        return -1;
-    }
-    if (!tool) {
-        tool = "index_repository";
+    if (status != CBM_INDEX_WORKER_ARGV_VALID) {
+        (void)fprintf(stderr, "CBM test index worker could not start: %s\n",
+                      cbm_index_worker_argv_status_message(status));
+        return 1;
     }
 
-    cbm_mem_init(0.5);
-    cbm_index_set_worker_role(true, response_out); /* worker role → index in-process */
+    cbm_index_set_worker_role_options(true, invocation.response_out, invocation.single_thread,
+                                      invocation.marker_file, invocation.quarantine_file,
+                                      invocation.memory_budget_bytes);
+    cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
+    tf_index_worker_probe(invocation.args_json, invocation.response_out);
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {
         return 1;
     }
-    char *result = cbm_mcp_handle_tool(srv, tool, args_json);
+    char *result = cbm_mcp_handle_tool(srv, "index_repository", invocation.args_json);
     if (result) {
         const char *ro = cbm_index_worker_response_out();
         if (ro) {
@@ -148,6 +212,236 @@ static int tf_maybe_run_socket_probe(int argc, char **argv) {
 #endif
 }
 
+/* Windows cannot use fork to prove process-to-process daemon lock ownership.
+ * The daemon IPC suite re-execs this runner in this narrow mode and observes
+ * the tri-state through a stable exit-code mapping: 0 acquired, 20 busy,
+ * 21 validation/OS error. */
+static int tf_maybe_run_daemon_ipc_lock_probe(int argc, char **argv) {
+#ifdef _WIN32
+    if (argc != 5 || strcmp(argv[1], "__cbm_daemon_ipc_lock_probe") != 0) {
+        return -1;
+    }
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        cbm_daemon_ipc_endpoint_new(argv[3], argv[4]);
+    if (!endpoint) {
+        return 21;
+    }
+    int result = -1;
+    if (strcmp(argv[2], "startup") == 0) {
+        cbm_daemon_ipc_startup_lock_t *lock = NULL;
+        result = cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &lock);
+        if (!cbm_daemon_ipc_startup_lock_release(&lock)) {
+            result = -1;
+        }
+    } else if (strcmp(argv[2], "lifetime") == 0) {
+        cbm_daemon_ipc_lifetime_reservation_t *reservation = NULL;
+        result = cbm_daemon_ipc_lifetime_reservation_try_acquire(
+            endpoint, &reservation);
+        cbm_daemon_ipc_lifetime_reservation_release(reservation);
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    return result == 1 ? 0 : (result == 0 ? 20 : 21);
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
+static int tf_maybe_run_version_cohort_crash_holder(int argc, char **argv) {
+#ifdef _WIN32
+    if (argc != 5 ||
+        strcmp(argv[1], "__cbm_version_cohort_crash_holder") != 0) {
+        return -1;
+    }
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        cbm_daemon_ipc_endpoint_new(argv[2], argv[3]);
+    cbm_version_cohort_manager_t *manager =
+        endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
+    cbm_daemon_build_identity_t identity = {
+        .semantic_version = "2.4.0",
+        .build_fingerprint =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .protocol_abi = 3,
+        .store_abi = 11,
+        .feature_abi = 7,
+    };
+    cbm_version_cohort_lease_t *lease = NULL;
+    cbm_daemon_conflict_t conflict;
+    cbm_version_cohort_status_t status =
+        manager ? cbm_version_cohort_acquire(manager, &identity, UINT64_MAX,
+                                              &lease, &conflict)
+                : CBM_VERSION_COHORT_IO;
+    FILE *ready = status == CBM_VERSION_COHORT_OK
+                      ? cbm_fopen(argv[4], "wb")
+                      : NULL;
+    bool announced = false;
+    if (ready) {
+        bool written = fputc('R', ready) != EOF;
+        announced = fclose(ready) == 0 && written;
+    }
+    if (announced) {
+        Sleep(INFINITE);
+        return 23;
+    }
+    while (lease && cbm_version_cohort_lease_release(&lease) !=
+                        CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    while (manager && cbm_version_cohort_manager_free(&manager) !=
+                          CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    return 22;
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
+static int tf_maybe_run_runtime_image_holder(int argc, char **argv) {
+#ifdef _WIN32
+    if (argc != 3 ||
+        strcmp(argv[1], "__cbm_runtime_image_holder") != 0) {
+        return -1;
+    }
+    HANDLE ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, argv[2]);
+    bool announced = ready && SetEvent(ready) != 0;
+    if (ready) {
+        (void)CloseHandle(ready);
+    }
+    if (!announced) {
+        return 24;
+    }
+    Sleep(INFINITE);
+    return 25;
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
+/* Real copied-image HELLO probe used by daemon_runtime. Keeping this in the
+ * test runner avoids any production-only test hook: the daemon authenticates
+ * and fingerprints an ordinary, separately executed process image. */
+static int tf_maybe_run_runtime_hello_client(int argc, char **argv) {
+    if (argc != 6 || strcmp(argv[1], "__cbm_runtime_hello_client") != 0) {
+        return -1;
+    }
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        cbm_daemon_ipc_endpoint_new(argv[3], argv[2]);
+    cbm_daemon_build_identity_t identity = {
+        .semantic_version = argv[4],
+        .build_fingerprint = argv[5],
+    };
+    cbm_daemon_runtime_connect_result_t result;
+    memset(&result, 0, sizeof(result));
+    cbm_daemon_runtime_client_t *client =
+        endpoint ? cbm_daemon_runtime_client_connect(endpoint, &identity, 5000,
+                                                     &result)
+                 : NULL;
+    bool accepted = client &&
+                    result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED &&
+                    result.hello_status == CBM_DAEMON_HELLO_COMPATIBLE;
+    bool closed = !client || cbm_daemon_runtime_client_close(client, 5000);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    if (!accepted) {
+        return 26;
+    }
+    return closed ? 0 : 27;
+}
+
+/* Real copied-image activation probe. The request identity is supplied by the
+ * executing copy so the daemon must authenticate that peer image rather than
+ * require the active generation's build fingerprint. */
+static int tf_maybe_run_runtime_activation_client(int argc, char **argv) {
+    if (argc != 7 ||
+        strcmp(argv[1], "__cbm_runtime_activation_client") != 0) {
+        return -1;
+    }
+    char *action_end = NULL;
+    unsigned long action_value = strtoul(argv[6], &action_end, 10);
+    bool action_valid = action_end != argv[6] && *action_end == '\0' &&
+                        action_value >= (unsigned long)
+                            CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL &&
+                        action_value <= (unsigned long)
+                            CBM_DAEMON_RUNTIME_ACTIVATION_UNINSTALL;
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        action_valid ? cbm_daemon_ipc_endpoint_new(argv[3], argv[2]) : NULL;
+    cbm_daemon_build_identity_t identity = {
+        .semantic_version = argv[4],
+        .build_fingerprint = argv[5],
+    };
+    cbm_daemon_runtime_activation_result_t result;
+    memset(&result, 0, sizeof(result));
+    bool exchanged = endpoint &&
+                     cbm_daemon_runtime_request_activation_shutdown(
+                         endpoint, &identity,
+                         (cbm_daemon_runtime_activation_action_t)action_value,
+                         5000, &result);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    return exchanged && result.accepted ? 0 : 29;
+}
+
+/* macOS adversarial HELLO probe: execute this mode from a foreign process
+ * image while mapping the genuine runner RX. The daemon must authenticate the
+ * main image, not merely find its own vnode in an arbitrary executable map. */
+static int tf_maybe_run_runtime_mapped_hello_client(int argc, char **argv) {
+#ifdef __APPLE__
+    if (argc != 7 ||
+        strcmp(argv[1], "__cbm_runtime_mapped_hello_client") != 0) {
+        return -1;
+    }
+    int image_fd = open(argv[2], O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    void *mapping = image_fd >= 0
+                        ? mmap(NULL, 1, PROT_READ | PROT_EXEC, MAP_PRIVATE,
+                               image_fd, 0)
+                        : MAP_FAILED;
+    bool mapped = mapping != MAP_FAILED;
+    if (image_fd >= 0 && close(image_fd) != 0) {
+        mapped = false;
+    }
+    if (!mapped) {
+        if (mapping != MAP_FAILED) {
+            (void)munmap(mapping, 1);
+        }
+        return 28;
+    }
+
+    char *hello_argv[] = {argv[0], "__cbm_runtime_hello_client", argv[3],
+                          argv[4], argv[5], argv[6]};
+    int result = tf_maybe_run_runtime_hello_client(6, hello_argv);
+    if (munmap(mapping, 1) != 0) {
+        return 28;
+    }
+    return result >= 0 ? result : 28;
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
+static int tf_maybe_run_mcp_idxfailclosed_probe(int argc, char **argv) {
+#ifndef _WIN32
+    if (argc != 4 ||
+        strcmp(argv[1], "__cbm_mcp_idxfailclosed_probe") != 0) {
+        return -1;
+    }
+    extern int mcp_test_idxfailclosed_supervisor_start_check(
+        const char *repo_dir, const char *cache_dir);
+    alarm(20);
+    return mcp_test_idxfailclosed_supervisor_start_check(argv[2], argv[3]);
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
 static bool *g_suite_arg_matched = NULL;
@@ -182,6 +476,8 @@ extern void suite_log(void);
 extern void suite_str_util(void);
 extern void suite_platform(void);
 extern void suite_subprocess(void);
+extern void suite_private_file_lock(void);
+extern void suite_lock_registry(void);
 extern void suite_extraction(void);
 extern void suite_extraction_inheritance(void);
 extern void suite_extraction_imports(void);
@@ -195,6 +491,17 @@ extern void suite_store_edges(void);
 extern void suite_store_search(void);
 extern void suite_cypher(void);
 extern void suite_mcp(void);
+extern void suite_mcp_mutation_guard(void);
+extern void suite_index_supervisor(void);
+extern void suite_daemon(void);
+extern void suite_project_lock(void);
+extern void suite_version_cohort(void);
+extern void suite_daemon_version(void);
+extern void suite_daemon_runtime(void);
+extern void suite_daemon_application(void);
+extern void suite_daemon_frontend(void);
+extern void suite_daemon_bootstrap(void);
+extern void suite_daemon_ipc(void);
 extern void suite_language(void);
 extern void suite_userconfig(void);
 extern void suite_gitignore(void);
@@ -203,6 +510,7 @@ extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_cross_repo(void);
 extern void suite_index_resilience(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
@@ -243,6 +551,7 @@ extern void suite_config_json_like(void);
 extern void suite_config_toml_edit(void);
 extern void suite_config_yaml_edit(void);
 extern void suite_config_text_edit(void);
+extern void suite_activation_transaction(void);
 extern void suite_system_info(void);
 extern void suite_worker_pool(void);
 extern void suite_parallel(void);
@@ -283,12 +592,59 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
+    /* Installation tests use this executable as a structurally real candidate.
+     * Mirror the production binary's minimal verification contract. */
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        (void)puts("codebase-memory-mcp test-runner");
+        return 0;
+    }
+    int mcp_idxfailclosed_rc =
+        tf_maybe_run_mcp_idxfailclosed_probe(argc, argv);
+    if (mcp_idxfailclosed_rc >= 0) {
+        return mcp_idxfailclosed_rc;
+    }
+    int runtime_image_rc =
+        tf_maybe_run_runtime_image_holder(argc, argv);
+    if (runtime_image_rc >= 0) {
+        return runtime_image_rc;
+    }
+    int runtime_hello_rc =
+        tf_maybe_run_runtime_hello_client(argc, argv);
+    if (runtime_hello_rc >= 0) {
+        return runtime_hello_rc;
+    }
+    int runtime_activation_rc =
+        tf_maybe_run_runtime_activation_client(argc, argv);
+    if (runtime_activation_rc >= 0) {
+        return runtime_activation_rc;
+    }
+    int runtime_mapped_hello_rc =
+        tf_maybe_run_runtime_mapped_hello_client(argc, argv);
+    if (runtime_mapped_hello_rc >= 0) {
+        return runtime_mapped_hello_rc;
+    }
+    int cohort_crash_rc =
+        tf_maybe_run_version_cohort_crash_holder(argc, argv);
+    if (cohort_crash_rc >= 0) {
+        return cohort_crash_rc;
+    }
+    int daemon_ipc_probe_rc =
+        tf_maybe_run_daemon_ipc_lock_probe(argc, argv);
+    if (daemon_ipc_probe_rc >= 0) {
+        return daemon_ipc_probe_rc;
+    }
+
     /* #798 follow-up: if spawned as the socket-isolation probe, report whether an
      * inheritable socket handle crossed into this child and exit before any suite. */
     int probe_rc = tf_maybe_run_socket_probe(argc, argv);
     if (probe_rc >= 0) {
         return probe_rc;
     }
+
+    /* Capture once so the parent tests and any re-exec'd worker bind to this
+     * executable image. A worker with an unavailable/mismatched identity is
+     * rejected by the exact parser below before any suite or MCP state exists. */
+    (void)cbm_index_supervisor_capture_build_fingerprint();
 
     /* #832: if spawned as a supervised index worker, do the real work and exit
      * before any suite runs (see tf_maybe_run_index_worker). */
@@ -328,6 +684,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(str_util);
     RUN_SELECTED_SUITE(platform);
     RUN_SELECTED_SUITE(subprocess);
+    RUN_SELECTED_SUITE(private_file_lock);
+    RUN_SELECTED_SUITE(lock_registry);
     RUN_SELECTED_SUITE(dump_verify);
 
     /* Existing C code regression tests */
@@ -354,6 +712,19 @@ int main(int argc, char **argv) {
 
     /* MCP Server (M9) */
     RUN_SELECTED_SUITE(mcp);
+    RUN_SELECTED_SUITE(mcp_mutation_guard);
+    RUN_SELECTED_SUITE(index_supervisor);
+
+    /* Shared MCP daemon coordination + private framing */
+    RUN_SELECTED_SUITE(daemon);
+    RUN_SELECTED_SUITE(project_lock);
+    RUN_SELECTED_SUITE(version_cohort);
+    RUN_SELECTED_SUITE(daemon_version);
+    RUN_SELECTED_SUITE(daemon_runtime);
+    RUN_SELECTED_SUITE(daemon_application);
+    RUN_SELECTED_SUITE(daemon_frontend);
+    RUN_SELECTED_SUITE(daemon_bootstrap);
+    RUN_SELECTED_SUITE(daemon_ipc);
 
     /* Discover (M2) */
     RUN_SELECTED_SUITE(language);
@@ -368,6 +739,7 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(cross_repo);
     RUN_SELECTED_SUITE(index_resilience);
     RUN_SELECTED_SUITE(fqn);
     RUN_SELECTED_SUITE(route_canon);
@@ -425,6 +797,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(config_toml_edit);
     RUN_SELECTED_SUITE(config_yaml_edit);
     RUN_SELECTED_SUITE(config_text_edit);
+    RUN_SELECTED_SUITE(activation_transaction);
 
     /* System info + worker pool (parallelism) */
     RUN_SELECTED_SUITE(system_info);

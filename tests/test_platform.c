@@ -3,8 +3,11 @@
  */
 #include "test_framework.h"
 #include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
+#include "../src/foundation/compat_thread.h"
 #include "../src/foundation/platform.h"
+#include "../src/foundation/platform_internal.h"
 #include "../src/foundation/system_info_internal.h"
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -17,6 +20,81 @@
 #include <string.h>
 #include <sys/stat.h>
 #endif
+
+enum { PLATFORM_TIME_THREADS = 8 };
+
+TEST(platform_counter_scaling_avoids_intermediate_overflow) {
+    const uint64_t frequency = UINT64_C(10000000);
+    const uint64_t counter = UINT64_C(20000000000);
+
+    ASSERT(cbm_platform_scale_counter_ns(counter, frequency) == UINT64_C(2000000000000));
+    ASSERT(cbm_platform_scale_counter_ns(UINT64_MAX, UINT64_MAX) == UINT64_C(1000000000));
+    ASSERT(cbm_platform_scale_counter_ns(UINT64_MAX, 1) == UINT64_MAX);
+    PASS();
+}
+
+TEST(platform_counter_scaling_preserves_monotonic_deadlines) {
+    const uint64_t frequency = UINT64_C(10000000);
+    const uint64_t counter = UINT64_MAX / UINT64_C(1000000000);
+    const uint64_t now_ns = cbm_platform_scale_counter_ns(counter, frequency);
+    const uint64_t next_ns = cbm_platform_scale_counter_ns(counter + 1, frequency);
+    const uint64_t deadline_ns = cbm_platform_scale_counter_ns(counter + 5 * frequency, frequency);
+
+    ASSERT(next_ns >= now_ns);
+    ASSERT(deadline_ns > now_ns);
+    ASSERT(deadline_ns - now_ns == UINT64_C(5000000000));
+    PASS();
+}
+
+typedef struct {
+    atomic_int *ready;
+    atomic_bool *go;
+    uint64_t value;
+} platform_time_worker_t;
+
+static void *platform_time_first_call(void *opaque) {
+    platform_time_worker_t *worker = opaque;
+    (void)atomic_fetch_add_explicit(worker->ready, 1, memory_order_acq_rel);
+    while (!atomic_load_explicit(worker->go, memory_order_acquire)) {
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+    worker->value = cbm_now_ns();
+    return NULL;
+}
+
+TEST(platform_now_ns_concurrent_first_call) {
+    cbm_thread_t threads[PLATFORM_TIME_THREADS];
+    platform_time_worker_t workers[PLATFORM_TIME_THREADS];
+    atomic_int ready;
+    atomic_bool go;
+    atomic_init(&ready, 0);
+    atomic_init(&go, false);
+    size_t created = 0;
+    for (; created < PLATFORM_TIME_THREADS; created++) {
+        workers[created] = (platform_time_worker_t){
+            .ready = &ready,
+            .go = &go,
+        };
+        if (cbm_thread_create(&threads[created], 0, platform_time_first_call, &workers[created]) !=
+            0) {
+            break;
+        }
+    }
+    while (created == PLATFORM_TIME_THREADS &&
+           atomic_load_explicit(&ready, memory_order_acquire) != PLATFORM_TIME_THREADS) {
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+    atomic_store_explicit(&go, true, memory_order_release);
+    for (size_t index = 0; index < created; index++) {
+        (void)cbm_thread_join(&threads[index]);
+    }
+
+    ASSERT_EQ(created, PLATFORM_TIME_THREADS);
+    for (size_t index = 0; index < created; index++) {
+        ASSERT_GT(workers[index].value, 0);
+    }
+    PASS();
+}
 
 TEST(platform_now_ns) {
     uint64_t t1 = cbm_now_ns();
@@ -78,6 +156,87 @@ TEST(platform_mmap_nonexistent) {
     size_t sz = 0;
     void *data = cbm_mmap_read("nonexistent_xyz.txt", &sz);
     ASSERT_NULL(data);
+    PASS();
+}
+
+typedef struct {
+    const char *home;
+    const char *cache;
+    atomic_int *ready;
+    atomic_int *release;
+} platform_path_thread_result_t;
+
+static void *platform_capture_path_buffers(void *opaque) {
+    platform_path_thread_result_t *result = opaque;
+    result->home = cbm_get_home_dir();
+    result->cache = cbm_resolve_cache_dir();
+    atomic_fetch_add_explicit(result->ready, 1, memory_order_release);
+    while (atomic_load_explicit(result->release, memory_order_acquire) == 0) {
+        cbm_usleep(1000);
+    }
+    return NULL;
+}
+
+/* The daemon dispatches different sessions concurrently. Path helpers may
+ * retain their historical return-pointer API, but each live thread needs
+ * separate storage; process-global mutable buffers are a C data race. */
+TEST(platform_path_helpers_use_per_thread_storage) {
+    const char *saved_home = getenv("HOME");
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_home_copy = saved_home ? strdup(saved_home) : NULL;
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("HOME", "/tmp/cbm-platform-thread-home", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", "/tmp/cbm-platform-thread-cache", 1), 0);
+
+    atomic_int ready;
+    atomic_int release;
+    atomic_init(&ready, 0);
+    atomic_init(&release, 0);
+    platform_path_thread_result_t results[2] = {
+        {.ready = &ready, .release = &release},
+        {.ready = &ready, .release = &release},
+    };
+    cbm_thread_t threads[2];
+    bool started0 = cbm_thread_create(&threads[0], 0, platform_capture_path_buffers,
+                                      &results[0]) == 0;
+    bool started1 = cbm_thread_create(&threads[1], 0, platform_capture_path_buffers,
+                                      &results[1]) == 0;
+    for (int spins = 0; started0 && started1 && spins < 5000 &&
+                        atomic_load_explicit(&ready, memory_order_acquire) < 2;
+         spins++) {
+        cbm_usleep(1000);
+    }
+    bool both_ready = atomic_load_explicit(&ready, memory_order_acquire) == 2;
+    bool separate_home = both_ready && results[0].home && results[1].home &&
+                         results[0].home != results[1].home;
+    bool separate_cache = both_ready && results[0].cache && results[1].cache &&
+                          results[0].cache != results[1].cache;
+    atomic_store_explicit(&release, 1, memory_order_release);
+    if (started0) {
+        (void)cbm_thread_join(&threads[0]);
+    }
+    if (started1) {
+        (void)cbm_thread_join(&threads[1]);
+    }
+
+    if (saved_home_copy) {
+        (void)cbm_setenv("HOME", saved_home_copy, 1);
+    } else {
+        (void)cbm_unsetenv("HOME");
+    }
+    if (saved_cache_copy) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_home_copy);
+    free(saved_cache_copy);
+
+    ASSERT_TRUE(started0);
+    ASSERT_TRUE(started1);
+    ASSERT_TRUE(both_ready);
+    ASSERT_TRUE(separate_home);
+    ASSERT_TRUE(separate_cache);
     PASS();
 }
 
@@ -312,6 +471,9 @@ TEST(cgroup_no_mem_files) {
 #endif /* __linux__ */
 
 SUITE(platform) {
+    RUN_TEST(platform_counter_scaling_avoids_intermediate_overflow);
+    RUN_TEST(platform_counter_scaling_preserves_monotonic_deadlines);
+    RUN_TEST(platform_now_ns_concurrent_first_call);
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);
     RUN_TEST(platform_nprocs);
@@ -320,6 +482,7 @@ SUITE(platform) {
     RUN_TEST(platform_file_size);
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
+    RUN_TEST(platform_path_helpers_use_per_thread_storage);
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);

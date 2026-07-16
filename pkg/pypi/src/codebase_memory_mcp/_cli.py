@@ -2,14 +2,16 @@
 
 import hashlib
 import os
-import sys
 import platform
-import stat
 import shutil
+import stat
+import subprocess
+import sys
 import tempfile
-import urllib.request
+import time
 import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 REPO = "DeusData/codebase-memory-mcp"
@@ -18,16 +20,99 @@ REPO = "DeusData/codebase-memory-mcp"
 # file://, ftp://, and custom schemes — a redirect or tainted URL source
 # could otherwise turn a download into an arbitrary-local-file read.
 _ALLOWED_SCHEMES = frozenset({"https"})
+_MAX_REDIRECTS = 5
+_NETWORK_TIMEOUT_SECONDS = 120
+_CANDIDATE_TIMEOUT_SECONDS = 15
+_MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Expose redirects to _download_https for explicit per-hop validation."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_HTTPS_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 
 def _validate_url_scheme(url: str) -> None:
     """Reject non-https URLs before any network fetch."""
-    scheme = urllib.parse.urlparse(url).scheme
-    if scheme not in _ALLOWED_SCHEMES:
+    parsed = urllib.parse.urlparse(url)
+    if (
+        parsed.scheme not in _ALLOWED_SCHEMES
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         sys.exit(
-            f"codebase-memory-mcp: refusing to fetch non-https URL "
-            f"(scheme={scheme!r}): {url}"
+            f"codebase-memory-mcp: refusing to fetch invalid, credentialed, or "
+            f"non-https URL: {url}"
         )
+
+
+def _download_https(url: str, dest: str, max_bytes: int = 0) -> None:
+    """Download through a bounded HTTPS-only opener into dest."""
+    current_url = url
+    for redirect_count in range(_MAX_REDIRECTS + 1):
+        _validate_url_scheme(current_url)
+        request = urllib.request.Request(
+            current_url, headers={"User-Agent": "codebase-memory-mcp-installer"}
+        )
+        try:
+            response = _HTTPS_OPENER.open(
+                request, timeout=_NETWORK_TIMEOUT_SECONDS
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code not in _REDIRECT_CODES:
+                raise
+            location = exc.headers.get("Location")
+            exc.close()
+            if not location:
+                raise RuntimeError(f"redirect has no Location: {current_url}")
+            if redirect_count == _MAX_REDIRECTS:
+                raise RuntimeError("too many redirects")
+            current_url = urllib.parse.urljoin(current_url, location)
+            _validate_url_scheme(current_url)
+            continue
+
+        with response:
+            _validate_url_scheme(response.geturl())
+            deadline = time.monotonic() + _NETWORK_TIMEOUT_SECONDS
+            total = 0
+            with open(dest, "wb") as out:
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"download hop timed out: {current_url}"
+                        )
+                    chunk = response.read(65536)
+                    if not chunk:
+                        return
+                    total += len(chunk)
+                    if max_bytes and total > max_bytes:
+                        raise RuntimeError(
+                            f"download exceeds the {max_bytes}-byte safety limit"
+                        )
+                    out.write(chunk)
+
+    raise RuntimeError("too many redirects")
+
+
+def _verify_candidate(path: Path) -> None:
+    """Require a staged native candidate to execute successfully."""
+    try:
+        subprocess.run(
+            [str(path), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=_CANDIDATE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"downloaded binary failed to run: {exc}") from exc
 
 
 def _safe_extract_tar(tf, dest: str) -> None:
@@ -73,37 +158,61 @@ def _safe_extract_zip(zf, dest: str) -> None:
 def _verify_checksum(archive_path: str, archive_name: str, version: str) -> None:
     """Verify SHA256 checksum against checksums.txt from the release."""
     url = f"https://github.com/{REPO}/releases/download/v{version}/checksums.txt"
+    tmp_path = None
     try:
         _validate_url_scheme(url)
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
             tmp_path = tmp.name
-        urllib.request.urlretrieve(url, tmp_path)  # noqa: S310 — scheme validated above
-        with open(tmp_path) as f:
+        _download_https(url, tmp_path, _MAX_CHECKSUM_MANIFEST_BYTES)
+        expected = None
+        with open(tmp_path, encoding="utf-8") as f:
             for line in f:
-                if archive_name in line:
-                    expected = line.split()[0]
-                    h = hashlib.sha256()
-                    with open(archive_path, "rb") as af:
-                        for chunk in iter(lambda: af.read(65536), b""):
-                            h.update(chunk)
-                    actual = h.hexdigest()
-                    if expected != actual:
-                        sys.exit(
-                            f"codebase-memory-mcp: CHECKSUM MISMATCH for {archive_name}\n"
-                            f"  expected: {expected}\n"
-                            f"  actual:   {actual}"
-                        )
-                    print("codebase-memory-mcp: checksum verified.", file=sys.stderr)
-                    break
+                fields = line.split()
+                if len(fields) < 2 or fields[1] not in (
+                    archive_name,
+                    f"*{archive_name}",
+                ):
+                    continue
+                digest = fields[0].lower()
+                if len(digest) != 64 or any(
+                    ch not in "0123456789abcdef" for ch in digest
+                ):
+                    sys.exit(
+                        f"codebase-memory-mcp: invalid SHA256 checksum for "
+                        f"{archive_name}"
+                    )
+                if expected is not None and expected != digest:
+                    sys.exit(
+                        f"codebase-memory-mcp: conflicting SHA256 checksums for "
+                        f"{archive_name}"
+                    )
+                expected = digest
+        if expected is None:
+            sys.exit(
+                f"codebase-memory-mcp: no checksum for {archive_name} in checksums.txt"
+            )
+        h = hashlib.sha256()
+        with open(archive_path, "rb") as af:
+            for chunk in iter(lambda: af.read(65536), b""):
+                h.update(chunk)
+        actual = h.hexdigest()
+        if expected != actual:
+            sys.exit(
+                f"codebase-memory-mcp: CHECKSUM MISMATCH for {archive_name}\n"
+                f"  expected: {expected}\n"
+                f"  actual:   {actual}"
+            )
+        print("codebase-memory-mcp: checksum verified.", file=sys.stderr)
     except SystemExit:
         raise
-    except Exception:
-        pass  # Non-fatal: checksum unavailable
+    except Exception as exc:
+        sys.exit(f"codebase-memory-mcp: checksum verification failed: {exc}")
     finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 def _version() -> str:
@@ -175,8 +284,8 @@ def _download(version: str) -> Path:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_archive = os.path.join(tmp, f"cbm.{ext}")
         try:
-            urllib.request.urlretrieve(url, tmp_archive)  # noqa: S310 — scheme validated above
-        except urllib.error.HTTPError as e:
+            _download_https(url, tmp_archive)
+        except (OSError, RuntimeError, urllib.error.URLError) as e:
             sys.exit(
                 f"codebase-memory-mcp: download failed ({e})\n"
                 f"URL: {url}\n"
@@ -199,9 +308,40 @@ def _download(version: str) -> Path:
         if not os.path.exists(extracted):
             sys.exit("codebase-memory-mcp: binary not found after extraction")
 
-        shutil.copy2(extracted, dest)
-        current = dest.stat().st_mode
-        dest.chmod(current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        extracted_path = Path(extracted)
+        current = extracted_path.stat().st_mode
+        extracted_path.chmod(current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        try:
+            _verify_candidate(extracted_path)
+        except RuntimeError as exc:
+            sys.exit(f"codebase-memory-mcp: {exc}")
+
+        staged_path = None
+        try:
+            staged_suffix = ".tmp.exe" if sys.platform == "win32" else ".tmp"
+            with tempfile.NamedTemporaryFile(
+                dir=str(dest.parent),
+                prefix=f".{dest.name}.",
+                suffix=staged_suffix,
+                delete=False,
+            ) as staged:
+                staged_path = Path(staged.name)
+            shutil.copy2(extracted_path, staged_path)
+            staged_mode = staged_path.stat().st_mode
+            staged_path.chmod(
+                staged_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
+            _verify_candidate(staged_path)
+            os.replace(staged_path, dest)
+            staged_path = None
+        except RuntimeError as exc:
+            sys.exit(f"codebase-memory-mcp: {exc}")
+        finally:
+            if staged_path is not None:
+                try:
+                    staged_path.unlink()
+                except OSError:
+                    pass
 
     return dest
 
@@ -222,6 +362,5 @@ def main() -> None:
     if sys.platform != "win32":
         os.execv(str(bin_path), args)  # noqa: S606 — list form, no shell
     else:
-        import subprocess
         result = subprocess.run(args)  # noqa: S603 — list form, no shell=True
         sys.exit(result.returncode)

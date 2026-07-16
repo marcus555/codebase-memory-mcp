@@ -5,11 +5,57 @@
  */
 #include "platform.h"
 
+#include "foundation/compat.h"
 #include "foundation/constants.h"
+#include "foundation/platform_internal.h"
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#define CBM_NSEC_PER_SEC 1000000000ULL
+
+static uint64_t cbm_platform_scale_fraction(uint64_t remainder, uint64_t multiplier,
+                                            uint64_t divisor) {
+    uint64_t quotient = 0;
+    uint64_t reduced = 0;
+    uint64_t mask = 1;
+    while (mask <= multiplier / 2) {
+        mask <<= 1U;
+    }
+    for (; mask != 0; mask >>= 1U) {
+        quotient *= 2;
+        if (reduced >= divisor - reduced) {
+            reduced -= divisor - reduced;
+            quotient++;
+        } else {
+            reduced += reduced;
+        }
+        if ((multiplier & mask) != 0) {
+            if (reduced >= divisor - remainder) {
+                reduced -= divisor - remainder;
+                quotient++;
+            } else {
+                reduced += remainder;
+            }
+        }
+    }
+    return quotient;
+}
+
+uint64_t cbm_platform_scale_counter_ns(uint64_t counter, uint64_t frequency) {
+    if (frequency == 0) {
+        return UINT64_MAX;
+    }
+    uint64_t whole_seconds = counter / frequency;
+    uint64_t remainder = counter % frequency;
+    if (whole_seconds > UINT64_MAX / CBM_NSEC_PER_SEC) {
+        return UINT64_MAX;
+    }
+    uint64_t whole_ns = whole_seconds * CBM_NSEC_PER_SEC;
+    uint64_t fraction_ns = cbm_platform_scale_fraction(remainder, CBM_NSEC_PER_SEC, frequency);
+    return fraction_ns > UINT64_MAX - whole_ns ? UINT64_MAX : whole_ns + fraction_ns;
+}
 
 /* Canonicalize a Windows drive letter to upper-case in place: "c:/x" -> "C:/x".
  * Windows drive letters are case-insensitive, but a lowercase one (as agent
@@ -90,7 +136,7 @@ uint64_t cbm_now_ns(void) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (uint64_t)count.QuadPart * 1000000000ULL / (uint64_t)freq.QuadPart;
+    return cbm_platform_scale_counter_ns((uint64_t)count.QuadPart, (uint64_t)freq.QuadPart);
 }
 
 #define CBM_USEC_PER_SEC 1000000ULL
@@ -165,6 +211,7 @@ char *cbm_normalize_path_sep(char *path) {
 
 #ifdef __APPLE__
 #include <mach/mach_time.h>
+#include <pthread.h>
 #include <sys/sysctl.h>
 #else
 #include <sched.h>
@@ -208,14 +255,19 @@ void cbm_munmap(void *addr, size_t size) {
 /* ── Timing ───────────────────────────── */
 
 #ifdef __APPLE__
-static mach_timebase_info_data_t timebase_info;
-static int timebase_init = 0;
+static mach_timebase_info_data_t timebase_info = {1, 1};
+static pthread_once_t timebase_once = PTHREAD_ONCE_INIT;
+
+static void cbm_timebase_initialize(void) {
+    (void)mach_timebase_info(&timebase_info);
+    if (timebase_info.numer == 0 || timebase_info.denom == 0) {
+        timebase_info.numer = 1;
+        timebase_info.denom = 1;
+    }
+}
 
 uint64_t cbm_now_ns(void) {
-    if (!timebase_init) {
-        mach_timebase_info(&timebase_info);
-        timebase_init = SKIP_ONE;
-    }
+    (void)pthread_once(&timebase_once, cbm_timebase_initialize);
     uint64_t ticks = mach_absolute_time();
     return ticks * timebase_info.numer / timebase_info.denom;
 }
@@ -361,7 +413,7 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
 /* ── Home directory (cross-platform) ───────────────────── */
 
 const char *cbm_get_home_dir(void) {
-    static char buf[CBM_SZ_1K];
+    static CBM_TLS char buf[CBM_SZ_1K];
     char tmp[CBM_SZ_256] = "";
 
     cbm_safe_getenv("HOME", tmp, sizeof(tmp), NULL);
@@ -383,7 +435,7 @@ const char *cbm_get_home_dir(void) {
 /* ── App config directories (cross-platform) ────────── */
 
 const char *cbm_app_config_dir(void) {
-    static char buf[CBM_SZ_1K];
+    static CBM_TLS char buf[CBM_SZ_1K];
     char tmp[CBM_SZ_256] = "";
 #ifdef _WIN32
     cbm_safe_getenv("APPDATA", tmp, sizeof(tmp), NULL);
@@ -416,7 +468,7 @@ const char *cbm_app_config_dir(void) {
 
 const char *cbm_app_local_dir(void) {
 #ifdef _WIN32
-    static char buf[CBM_SZ_1K];
+    static CBM_TLS char buf[CBM_SZ_1K];
     char tmp[CBM_SZ_256] = "";
     cbm_safe_getenv("LOCALAPPDATA", tmp, sizeof(tmp), NULL);
     if (tmp[0]) {
@@ -438,7 +490,7 @@ const char *cbm_app_local_dir(void) {
 /* ── Cache directory ────────────────────────── */
 
 const char *cbm_resolve_cache_dir(void) {
-    static char buf[CBM_SZ_1K];
+    static CBM_TLS char buf[CBM_SZ_1K];
     char tmp[CBM_SZ_256] = "";
     cbm_safe_getenv("CBM_CACHE_DIR", tmp, sizeof(tmp), NULL);
     if (tmp[0]) {

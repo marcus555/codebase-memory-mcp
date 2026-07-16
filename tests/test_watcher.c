@@ -8,6 +8,7 @@
 #include "../src/foundation/platform.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include <daemon/application.h>
 #include <watcher/watcher.h>
 #include <store/store.h>
 #include <errno.h>
@@ -254,6 +255,37 @@ static void prune_fixture_teardown(prune_fixture_t *f) {
     th_rmtree(f->cachedir);
 }
 
+typedef struct {
+    const char *root_to_restore;
+    bool allow;
+    bool restore_root;
+    int begins;
+    int ends;
+    int pruned;
+} prune_guard_probe_t;
+
+static bool prune_guard_probe_begin(void *context, const char *project) {
+    (void)project;
+    prune_guard_probe_t *probe = context;
+    probe->begins++;
+    if (probe->restore_root && probe->root_to_restore) {
+        (void)cbm_mkdir_p(probe->root_to_restore, 0755);
+    }
+    return probe->allow;
+}
+
+static void prune_guard_probe_end(void *context, const char *project) {
+    (void)project;
+    prune_guard_probe_t *probe = context;
+    probe->ends++;
+}
+
+static void prune_guard_probe_pruned(void *context, const char *project) {
+    (void)project;
+    prune_guard_probe_t *probe = context;
+    probe->pruned++;
+}
+
 TEST(watcher_prunes_sustained_missing_root) {
     /* Positive prune path. Grace window 0s isolates the streak-threshold
      * logic; the time gate is guarded by watcher_grace_window_blocks_prune. */
@@ -295,6 +327,180 @@ TEST(watcher_prunes_sustained_missing_root) {
     cbm_watcher_free(w);
     cbm_store_close(store);
     prune_fixture_teardown(&f);
+    PASS();
+}
+
+TEST(watcher_prune_waits_for_daemon_project_mutation) {
+    /* The daemon application owns project-operation coordination. Supplying
+     * its watcher must route destructive stale-root pruning through that
+     * coordination boundary: a busy project is retained and retried after
+     * the active operation releases its lease, never unlinked directly. */
+    prune_fixture_t f;
+    if (!prune_fixture_setup(&f, "0")) {
+        FAIL("prune fixture setup failed");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_daemon_application_config_t config = {.watcher = w};
+    cbm_daemon_application_t *application =
+        cbm_daemon_application_new(&config);
+    if (!store || !w || !application) {
+        cbm_daemon_application_free(application);
+        cbm_watcher_free(w);
+        cbm_store_close(store);
+        prune_fixture_teardown(&f);
+        FAIL("coordinated prune fixture setup failed");
+    }
+
+    cbm_watcher_watch(w, "stale-project", f.rootdir);
+    cbm_watcher_poll_once(w); /* establish the existing-root baseline */
+    th_rmtree(f.rootdir);
+
+    bool mutation_held =
+        cbm_daemon_application_project_mutation_try_begin(application,
+                                                          "stale-project");
+    for (int miss = 0; mutation_held && miss < 3; miss++) {
+        cbm_watcher_touch(w, "stale-project");
+        cbm_watcher_poll_once(w);
+    }
+
+    bool watch_preserved_while_busy = cbm_watcher_watch_count(w) == 1;
+    bool files_preserved_while_busy = access(f.db_path, F_OK) == 0 &&
+                                      access(f.wal_path, F_OK) == 0 &&
+                                      access(f.shm_path, F_OK) == 0;
+
+    if (mutation_held) {
+        cbm_daemon_application_project_mutation_end(application, "stale-project");
+    }
+    if (cbm_watcher_watch_count(w) == 1) {
+        cbm_watcher_touch(w, "stale-project");
+        cbm_watcher_poll_once(w);
+    }
+    bool pruned_after_release = cbm_watcher_watch_count(w) == 0 &&
+                                access(f.db_path, F_OK) != 0 &&
+                                access(f.wal_path, F_OK) != 0 &&
+                                access(f.shm_path, F_OK) != 0;
+
+    cbm_daemon_application_free(application);
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    prune_fixture_teardown(&f);
+
+    ASSERT_TRUE(mutation_held);
+    ASSERT_TRUE(watch_preserved_while_busy);
+    ASSERT_TRUE(files_preserved_while_busy);
+    ASSERT_TRUE(pruned_after_release);
+    PASS();
+}
+
+TEST(watcher_prune_guard_denial_and_success_are_balanced) {
+    prune_fixture_t f;
+    if (!prune_fixture_setup(&f, "0")) {
+        FAIL("prune fixture setup failed");
+    }
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    prune_guard_probe_t probe = {0};
+    cbm_watcher_set_project_mutation_guard(
+        w, prune_guard_probe_begin, prune_guard_probe_end,
+        prune_guard_probe_pruned, &probe);
+    cbm_watcher_watch(w, "stale-project", f.rootdir);
+    cbm_watcher_poll_once(w);
+    th_rmtree(f.rootdir);
+    for (int miss = 0; miss < 3; miss++) {
+        cbm_watcher_touch(w, "stale-project");
+        cbm_watcher_poll_once(w);
+    }
+    bool denied_preserved = cbm_watcher_watch_count(w) == 1 &&
+                            access(f.db_path, F_OK) == 0 && probe.begins == 1 &&
+                            probe.ends == 0 && probe.pruned == 0;
+
+    probe.allow = true;
+    cbm_watcher_touch(w, "stale-project");
+    cbm_watcher_poll_once(w);
+    bool success_balanced = cbm_watcher_watch_count(w) == 0 &&
+                            access(f.db_path, F_OK) != 0 && probe.begins == 2 &&
+                            probe.ends == 1 && probe.pruned == 1;
+
+    cbm_watcher_set_project_mutation_guard(w, NULL, NULL, NULL, NULL);
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    prune_fixture_teardown(&f);
+    ASSERT_TRUE(denied_preserved);
+    ASSERT_TRUE(success_balanced);
+    PASS();
+}
+
+TEST(watcher_prune_restats_root_after_guard_acquisition) {
+    prune_fixture_t f;
+    if (!prune_fixture_setup(&f, "0")) {
+        FAIL("prune fixture setup failed");
+    }
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    prune_guard_probe_t probe = {
+        .root_to_restore = f.rootdir,
+        .allow = true,
+        .restore_root = true,
+    };
+    cbm_watcher_set_project_mutation_guard(
+        w, prune_guard_probe_begin, prune_guard_probe_end,
+        prune_guard_probe_pruned, &probe);
+    cbm_watcher_watch(w, "stale-project", f.rootdir);
+    cbm_watcher_poll_once(w);
+    th_rmtree(f.rootdir);
+    for (int miss = 0; miss < 3; miss++) {
+        cbm_watcher_touch(w, "stale-project");
+        cbm_watcher_poll_once(w);
+    }
+
+    bool restored = access(f.rootdir, F_OK) == 0;
+    bool retained = cbm_watcher_watch_count(w) == 1 &&
+                    access(f.db_path, F_OK) == 0 && access(f.wal_path, F_OK) == 0 &&
+                    access(f.shm_path, F_OK) == 0;
+    bool balanced = probe.begins == 1 && probe.ends == 1 && probe.pruned == 0;
+    cbm_watcher_set_project_mutation_guard(w, NULL, NULL, NULL, NULL);
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    prune_fixture_teardown(&f);
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(retained);
+    ASSERT_TRUE(balanced);
+    PASS();
+}
+
+TEST(watcher_prune_delete_failure_retains_watch_for_retry) {
+    prune_fixture_t f;
+    if (!prune_fixture_setup(&f, "0")) {
+        FAIL("prune fixture setup failed");
+    }
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "stale-project", f.rootdir);
+    cbm_watcher_poll_once(w);
+    th_rmtree(f.rootdir);
+
+    /* A directory at the main DB path makes unlink fail deterministically on
+     * POSIX and Windows. The watcher must remain registered for a later retry
+     * and must not delete recoverable sidecars after that failure. */
+    bool failure_ready = cbm_unlink(f.db_path) == 0 &&
+                         cbm_mkdir_p(f.db_path, 0755);
+    for (int miss = 0; failure_ready && miss < 3; miss++) {
+        cbm_watcher_touch(w, "stale-project");
+        cbm_watcher_poll_once(w);
+    }
+    bool watch_retained = cbm_watcher_watch_count(w) == 1;
+    bool artifacts_retained = access(f.db_path, F_OK) == 0 &&
+                              access(f.wal_path, F_OK) == 0 &&
+                              access(f.shm_path, F_OK) == 0;
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    prune_fixture_teardown(&f);
+    ASSERT_TRUE(failure_ready);
+    ASSERT_TRUE(watch_retained);
+    ASSERT_TRUE(artifacts_retained);
     PASS();
 }
 
@@ -547,6 +753,52 @@ TEST(watcher_detects_dirty_worktree) {
     ASSERT_EQ(index_call_count, 1);
 
     /* Cleanup */
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_identical_watch_preserves_dirty_baseline) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_same_root_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+
+    cbm_watcher_watch(w, "same-root-repo", tmpdir);
+    index_call_count = 0;
+
+    /* Establish the clean baseline before making the worktree dirty. */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(index_call_count, 0);
+
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "modified\n");
+    }
+
+    cbm_watcher_touch(w, "same-root-repo");
+
+    /* An identical registration must preserve the established baseline. */
+    cbm_watcher_watch(w, "same-root-repo", tmpdir);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(index_call_count, 1);
+
     cbm_watcher_free(w);
     cbm_store_close(store);
     th_rmtree(tmpdir);
@@ -2042,6 +2294,145 @@ TEST(watcher_unwatch_drains_pending_free) {
     PASS();
 }
 
+typedef struct {
+    cbm_watcher_t *watcher;
+    const char *first_project;
+    const char *second_project;
+    int calls;
+} unwatch_snapshot_ctx_t;
+
+static int unwatch_snapshot_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    unwatch_snapshot_ctx_t *ctx = ud;
+    ctx->calls++;
+    if (ctx->calls == 1) {
+        /* Both states are already present in poll_once's pointer snapshot.
+         * Removing them must invalidate the not-yet-admitted callback. */
+        cbm_watcher_unwatch(ctx->watcher, ctx->first_project);
+        cbm_watcher_unwatch(ctx->watcher, ctx->second_project);
+    }
+    return 0;
+}
+
+TEST(watcher_unwatch_invalidates_remaining_poll_snapshot) {
+    char first[256];
+    char second[256];
+    snprintf(first, sizeof(first), "/tmp/cbm_watcher_unwatch_snap_a_XXXXXX");
+    snprintf(second, sizeof(second), "/tmp/cbm_watcher_unwatch_snap_b_XXXXXX");
+    if (!cbm_mkdtemp(first) || !cbm_mkdtemp(second)) {
+        th_rmtree(first);
+        th_rmtree(second);
+        FAIL("cbm_mkdtemp failed");
+    }
+    if (wt_git(first, "init -q") != 0 || wt_git(second, "init -q") != 0) {
+        th_rmtree(first);
+        th_rmtree(second);
+        FAIL("git init failed");
+    }
+    char path[300];
+    th_write_file(wt_path(path, sizeof(path), first, "file.txt"), "first\n");
+    th_write_file(wt_path(path, sizeof(path), second, "file.txt"), "second\n");
+    wt_git(first, "add file.txt");
+    wt_git(first, "commit -q -m init");
+    wt_git(second, "add file.txt");
+    wt_git(second, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    unwatch_snapshot_ctx_t ctx = {
+        .first_project = "unwatch-snapshot-a",
+        .second_project = "unwatch-snapshot-b",
+    };
+    cbm_watcher_t *w = cbm_watcher_new(store, unwatch_snapshot_callback, &ctx);
+    ctx.watcher = w;
+    cbm_watcher_watch(w, ctx.first_project, first);
+    cbm_watcher_watch(w, ctx.second_project, second);
+    (void)cbm_watcher_poll_once(w);
+
+    th_append_file(wt_path(path, sizeof(path), first, "file.txt"), "dirty\n");
+    th_append_file(wt_path(path, sizeof(path), second, "file.txt"), "dirty\n");
+    cbm_watcher_touch(w, ctx.first_project);
+    cbm_watcher_touch(w, ctx.second_project);
+    int reindexed = cbm_watcher_poll_once(w);
+    int watches_after_callback = cbm_watcher_watch_count(w);
+    (void)cbm_watcher_poll_once(w); /* drain the two deferred states */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(first);
+    th_rmtree(second);
+
+    ASSERT_EQ(ctx.calls, 1);
+    ASSERT_EQ(reindexed, 1);
+    ASSERT_EQ(watches_after_callback, 0);
+    PASS();
+}
+
+typedef struct {
+    cbm_watcher_t *watcher;
+    const char *replacement_root;
+    int calls;
+} replace_during_poll_ctx_t;
+
+static int replace_during_poll_callback(const char *name, const char *path, void *ud) {
+    (void)path;
+    replace_during_poll_ctx_t *ctx = ud;
+    ctx->calls++;
+    /* Re-registering can happen when a second daemon session initializes while
+     * this project's watcher snapshot is being polled. The old state must stay
+     * alive until the snapshot finishes using it. */
+    cbm_watcher_watch(ctx->watcher, name, ctx->replacement_root);
+    return 0;
+}
+
+TEST(watcher_replace_during_poll_defers_old_state_free) {
+    char original[256];
+    char replacement[256];
+    snprintf(original, sizeof(original), "/tmp/cbm_watcher_replace_old_XXXXXX");
+    snprintf(replacement, sizeof(replacement), "/tmp/cbm_watcher_replace_new_XXXXXX");
+    if (!cbm_mkdtemp(original) || !cbm_mkdtemp(replacement)) {
+        th_rmtree(original);
+        th_rmtree(replacement);
+        FAIL("cbm_mkdtemp failed");
+    }
+    if (wt_git(original, "init -q") != 0) {
+        th_rmtree(original);
+        th_rmtree(replacement);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), original, "file.txt"), "hello\n");
+    }
+    wt_git(original, "add file.txt");
+    wt_git(original, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    replace_during_poll_ctx_t ctx = {.replacement_root = replacement};
+    cbm_watcher_t *w = cbm_watcher_new(store, replace_during_poll_callback, &ctx);
+    ASSERT_NOT_NULL(w);
+    ctx.watcher = w;
+    cbm_watcher_watch(w, "replace-repo", original);
+
+    cbm_watcher_poll_once(w); /* baseline */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), original, "file.txt"), "dirty\n");
+    }
+    cbm_watcher_touch(w, "replace-repo");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 1);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+
+    /* Drains the deferred old snapshot state after the prior poll completed. */
+    (void)cbm_watcher_poll_once(w);
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(original);
+    th_rmtree(replacement);
+    PASS();
+}
+
 TEST(watcher_null_poll_once) {
     /* poll_once(NULL) → 0 */
     int reindexed = cbm_watcher_poll_once(NULL);
@@ -2078,6 +2469,10 @@ SUITE(watcher) {
     RUN_TEST(watcher_poll_no_projects);
     RUN_TEST(watcher_poll_nonexistent_path);
     RUN_TEST(watcher_prunes_sustained_missing_root);
+    RUN_TEST(watcher_prune_waits_for_daemon_project_mutation);
+    RUN_TEST(watcher_prune_guard_denial_and_success_are_balanced);
+    RUN_TEST(watcher_prune_restats_root_after_guard_acquisition);
+    RUN_TEST(watcher_prune_delete_failure_retains_watch_for_retry);
     RUN_TEST(watcher_grace_window_blocks_prune);
     RUN_TEST(watcher_root_missing_errno_classification);
     RUN_TEST(watcher_root_restore_resets_prune_streak);
@@ -2087,6 +2482,7 @@ SUITE(watcher) {
     /* Git change detection */
     RUN_TEST(watcher_detects_git_commit);
     RUN_TEST(watcher_detects_dirty_worktree);
+    RUN_TEST(watcher_identical_watch_preserves_dirty_baseline);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_no_change_no_reindex);
     RUN_TEST(watcher_dirty_state_reindexes_once_issue937);
@@ -2137,6 +2533,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_stop_prevents_run);
     RUN_TEST(watcher_watch_unwatch_rapid_cycle);
     RUN_TEST(watcher_unwatch_drains_pending_free);
+    RUN_TEST(watcher_unwatch_invalidates_remaining_poll_snapshot);
+    RUN_TEST(watcher_replace_during_poll_defers_old_state_free);
     RUN_TEST(watcher_callback_data_passed);
     RUN_TEST(watcher_null_poll_once);
     RUN_TEST(watcher_null_watch_count);

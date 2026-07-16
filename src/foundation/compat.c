@@ -7,6 +7,7 @@
 #include "foundation/compat.h"
 #include "foundation/constants.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
@@ -91,20 +92,28 @@ char *cbm_mkdtemp(char *tmpl) {
 #ifdef _WIN32
 int cbm_mkstemp(char *tmpl) {
     /* Rewrite /tmp/ to %TEMP%\ like cbm_mkdtemp */
-    static char buf[CBM_SZ_512];
+    /* Per-call storage: daemon project workers can create staging files
+     * concurrently, so a process-global scratch buffer is a data race. */
+    char buf[CBM_SZ_4K];
+    int written;
     if (strncmp(tmpl, "/tmp/", 5) == 0) {
         const char *tmp = getenv("TEMP");
         if (!tmp)
             tmp = getenv("TMP");
         if (!tmp)
             tmp = ".";
-        snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
+        written = snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
     } else {
-        snprintf(buf, sizeof(buf), "%s", tmpl);
+        written = snprintf(buf, sizeof(buf), "%s", tmpl);
+    }
+    if (written < 0 || (size_t)written >= sizeof(buf)) {
+        errno = ENAMETOOLONG;
+        return CBM_NOT_FOUND;
     }
     if (!_mktemp(buf))
         return CBM_NOT_FOUND;
-    int fd = _open(buf, _O_CREAT | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
+    int fd =
+        _open(buf, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
     if (fd >= 0)
         strcpy(tmpl, buf);
     return fd;

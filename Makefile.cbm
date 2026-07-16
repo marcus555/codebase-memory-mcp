@@ -78,12 +78,13 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
 
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
 # (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), and
+# advapi32 (owner-only activation-candidate ACLs), plus
 # --allow-multiple-definition (MinGW CRT symbol clashes).
 # Auto-detected via compiler; no manual override needed.
 IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
 WIN32_LIBS :=
 ifeq ($(IS_MINGW),yes)
-WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
+WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -117,7 +118,10 @@ FOUNDATION_SRCS = \
     src/foundation/dump_verify.c \
     src/foundation/limits.c \
     src/foundation/subprocess.c \
-    src/foundation/sha256.c
+    src/foundation/sha256.c \
+    src/foundation/macos_acl.c \
+    src/foundation/private_file_lock.c \
+    src/foundation/lock_registry.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -180,6 +184,19 @@ CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
 MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c
+
+# Shared MCP daemon coordination and local transport
+DAEMON_SRCS = \
+    src/daemon/daemon.c \
+    src/daemon/project_lock.c \
+    src/daemon/version_cohort.c \
+    src/daemon/service.c \
+    src/daemon/runtime.c \
+    src/daemon/application.c \
+    src/daemon/frontend.c \
+    src/daemon/host.c \
+    src/daemon/bootstrap.c \
+    src/daemon/ipc.c
 
 # Discover module (new)
 DISCOVER_SRCS = \
@@ -245,7 +262,7 @@ GIT_SRCS = src/git/git_context.c
 CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c \
 	src/cli/agent_clients.c src/cli/agent_profiles.c \
 	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
-	src/cli/config_text_edit.c
+	src/cli/config_text_edit.c src/cli/activation_transaction.c
 
 # UI module (graph visualization)
 UI_SRCS = \
@@ -304,7 +321,7 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
@@ -320,7 +337,9 @@ TEST_FOUNDATION_SRCS = \
     tests/test_str_util.c \
     tests/test_platform.c \
     tests/test_dump_verify.c \
-    tests/test_subprocess.c
+    tests/test_subprocess.c \
+    tests/test_private_file_lock.c \
+    tests/test_lock_registry.c
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
@@ -346,7 +365,19 @@ TEST_CYPHER_SRCS = \
     tests/test_cypher.c
 
 TEST_MCP_SRCS = \
-    tests/test_mcp.c
+    tests/test_mcp.c \
+    tests/test_index_supervisor.c
+
+TEST_DAEMON_SRCS = \
+    tests/test_daemon.c \
+    tests/test_project_lock.c \
+    tests/test_version_cohort.c \
+    tests/test_daemon_version.c \
+    tests/test_daemon_runtime.c \
+    tests/test_daemon_application.c \
+    tests/test_daemon_frontend.c \
+    tests/test_daemon_bootstrap.c \
+    tests/test_daemon_ipc.c
 
 TEST_DISCOVER_SRCS = \
     tests/test_language.c \
@@ -357,7 +388,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -403,7 +434,8 @@ TEST_TRACES_SRCS = tests/test_traces.c
 
 TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
 	tests/test_config_json_like.c \
-	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c
+	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c \
+	tests/test_activation_transaction.c
 
 TEST_MEM_SRCS = tests/test_mem.c
 
@@ -485,7 +517,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DAEMON_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────
@@ -513,7 +545,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -676,6 +708,12 @@ $(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) 
 test-tsan: $(BUILD_DIR)/test-runner-tsan
 	cd $(CURDIR) && TSAN_OPTIONS="$(TSAN_OPTIONS)" $(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
 
+# Real-binary POSIX lifecycle smoke. The endpoint is deliberately account-wide;
+# an explicit Make invocation requires a clean rendezvous and fails rather than
+# silently skipping an occupied one. Deterministic C tests cover Windows IPC.
+test-daemon-smoke: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && CBM_DAEMON_SMOKE_REQUIRE_RUN=1 python3 tests/test_daemon_smoke.py $(BUILD_DIR)/codebase-memory-mcp
+
 # ── Production binary ────────────────────────────────────────────
 
 # Grammar/TS/LSP objects for production (compiled with relaxed warnings, -O2)
@@ -763,7 +801,7 @@ SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
 SYSROOT_FLAG = $(if $(SYSROOT),-isysroot $(SYSROOT),)
 
 # Our source files (excluding vendored, grammars, tree-sitter runtime)
-LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) \
+LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) \
             $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) \
             $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
             $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC)

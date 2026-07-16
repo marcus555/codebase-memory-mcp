@@ -13,22 +13,33 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const (
 	repo    = "DeusData/codebase-memory-mcp"
 	version = "0.8.1"
+
+	maxRedirects            = 5
+	requestTimeout          = 2 * time.Minute
+	connectTimeout          = 15 * time.Second
+	responseHeaderTimeout   = 30 * time.Second
+	candidateTimeout        = 15 * time.Second
+	maxChecksumManifestSize = 1024 * 1024
 )
 
 func main() {
@@ -117,7 +128,11 @@ func download(dest string) error {
 		ext = "zip"
 	}
 
-	archive := fmt.Sprintf("codebase-memory-mcp-%s-%s.%s", platform, arch, ext)
+	portable := ""
+	if platform == "linux" {
+		portable = "-portable"
+	}
+	archive := fmt.Sprintf("codebase-memory-mcp-%s-%s%s.%s", platform, arch, portable, ext)
 	url := fmt.Sprintf("https://github.com/%s/releases/download/v%s/%s", repo, version, archive)
 	checksumURL := fmt.Sprintf("https://github.com/%s/releases/download/v%s/checksums.txt", repo, version)
 
@@ -134,13 +149,18 @@ func download(dest string) error {
 		return fmt.Errorf("download failed: %w", err)
 	}
 
-	// Verify checksum if available (non-fatal if checksums.txt unreachable)
-	if checksums, err := fetchChecksums(checksumURL); err == nil {
-		if expected, ok := checksums[archive]; ok {
-			if err := verifyChecksum(archivePath, expected); err != nil {
-				return err
-			}
-		}
+	// A release binary is executable input, so checksum verification is a
+	// mandatory precondition rather than a best-effort warning.
+	checksums, err := fetchChecksums(checksumURL)
+	if err != nil {
+		return fmt.Errorf("checksum manifest unavailable: %w", err)
+	}
+	expected, ok := checksums[archive]
+	if !ok {
+		return fmt.Errorf("checksum manifest has no entry for %s", archive)
+	}
+	if err := verifyChecksum(archivePath, expected); err != nil {
+		return err
 	}
 
 	binName := "codebase-memory-mcp"
@@ -157,17 +177,20 @@ func download(dest string) error {
 			return fmt.Errorf("extraction failed: %w", err)
 		}
 	}
+	extracted := filepath.Join(tmp, binName)
+	if err := os.Chmod(extracted, 0755); err != nil {
+		return fmt.Errorf("could not set candidate permissions: %w", err)
+	}
+	if err := verifyCandidate(extracted); err != nil {
+		return err
+	}
 
 	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
 		return fmt.Errorf("could not create cache dir: %w", err)
 	}
 
-	if err := copyFile(filepath.Join(tmp, binName), dest); err != nil {
+	if err := installCandidateAtomically(extracted, dest); err != nil {
 		return fmt.Errorf("could not install binary: %w", err)
-	}
-
-	if err := os.Chmod(dest, 0755); err != nil {
-		return fmt.Errorf("could not set permissions: %w", err)
 	}
 
 	return nil
@@ -175,7 +198,8 @@ func download(dest string) error {
 
 // validateURLScheme rejects non-https URLs before any fetch (defense-in-depth).
 func validateURLScheme(rawURL string) error {
-	if !strings.HasPrefix(rawURL, "https://") {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
 		return fmt.Errorf("refusing non-https URL: %s", rawURL)
 	}
 	return nil
@@ -183,11 +207,20 @@ func validateURLScheme(rawURL string) error {
 
 // httpsOnlyClient returns an HTTP client that rejects non-HTTPS redirects.
 var httpsOnlyClient = &http.Client{
+	Timeout: requestTimeout,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: connectTimeout}).DialContext,
+		ForceAttemptHTTP2:     true,
+		TLSHandshakeTimeout:   connectTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		ExpectContinueTimeout: time.Second,
+	},
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if req.URL.Scheme != "https" {
-			return fmt.Errorf("refusing non-https redirect to %s", req.URL)
+		if err := validateURLScheme(req.URL.String()); err != nil {
+			return fmt.Errorf("refusing unsafe redirect: %w", err)
 		}
-		if len(via) >= 10 {
+		if len(via) > maxRedirects {
 			return fmt.Errorf("too many redirects")
 		}
 		return nil
@@ -210,9 +243,12 @@ func httpGet(rawURL, dest string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	_, copyErr := io.Copy(f, resp.Body)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 func fetchChecksums(url string) (map[string]string, error) {
@@ -227,21 +263,45 @@ func fetchChecksums(url string) (map[string]string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumManifestSize+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > maxChecksumManifestSize {
+		return nil, fmt.Errorf("checksums.txt exceeds the 1 MiB safety limit")
 	}
 	result := make(map[string]string)
 	for _, line := range strings.Split(string(body), "\n") {
 		parts := strings.Fields(line)
 		if len(parts) == 2 {
-			result[parts[1]] = parts[0]
+			name := parts[1]
+			if strings.HasPrefix(name, "*") {
+				name = name[1:]
+			}
+			digest := strings.ToLower(parts[0])
+			if len(digest) != sha256.Size*2 {
+				return nil, fmt.Errorf("invalid SHA-256 checksum for %s", name)
+			}
+			if _, err := hex.DecodeString(digest); err != nil {
+				return nil, fmt.Errorf("invalid SHA-256 checksum for %s: %w", name, err)
+			}
+			if prior, exists := result[name]; exists && prior != digest {
+				return nil, fmt.Errorf("conflicting SHA-256 checksums for %s", name)
+			}
+			result[name] = digest
 		}
 	}
 	return result, nil
 }
 
 func verifyChecksum(path, expected string) error {
+	expected = strings.ToLower(expected)
+	if len(expected) != sha256.Size*2 {
+		return fmt.Errorf("invalid SHA-256 checksum length")
+	}
+	if _, err := hex.DecodeString(expected); err != nil {
+		return fmt.Errorf("invalid SHA-256 checksum: %w", err)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -316,19 +376,60 @@ func extractZip(archivePath, destDir, targetFile string) error {
 	return fmt.Errorf("%s not found in archive", targetFile)
 }
 
-func copyFile(src, dst string) error {
+func verifyCandidate(path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), candidateTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "--version")
+	cmd.Stdin = nil
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("downloaded binary verification timed out: %w", ctx.Err())
+		}
+		return fmt.Errorf("downloaded binary failed to run: %w", err)
+	}
+	return nil
+}
+
+func installCandidateAtomically(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(dst)
+	pattern := "." + filepath.Base(dst) + ".*.tmp"
+	if runtime.GOOS == "windows" {
+		pattern += ".exe"
+	}
+	out, err := os.CreateTemp(filepath.Dir(dst), pattern)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
+	staged := out.Name()
+	defer os.Remove(staged)
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Chmod(0755); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := verifyCandidate(staged); err != nil {
+		return err
+	}
+	if err := os.Rename(staged, dst); err != nil {
+		return err
+	}
+	return nil
 }
 
 func execBinary(bin string, args []string) error {

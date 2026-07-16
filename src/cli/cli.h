@@ -12,6 +12,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+typedef struct cbm_mcp_server cbm_mcp_server_t;
+
 /* ── Version ──────────────────────────────────────────────────── */
 
 /* Set the version string (called from main). */
@@ -35,6 +37,11 @@ char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char
  * derived from its input_schema, to stdout. Returns 0 if the tool is known,
  * non-zero (and prints nothing) if it is not. */
 int cbm_cli_print_tool_help(const char *tool_name);
+
+/* Inspect a raw MCP tool-result envelope. Returns true only when the root
+ * object carries the exact boolean field `isError: true`; malformed JSON,
+ * strings, and nested lookalikes are not tool errors. */
+bool cbm_cli_mcp_result_is_error(const char *result);
 
 /* ── Self-update: version comparison ──────────────────────────── */
 
@@ -345,7 +352,8 @@ cbm_config_t *cbm_config_open(const char *cache_dir);
 /* Close the config store. */
 void cbm_config_close(cbm_config_t *cfg);
 
-/* Get a config value. Returns default_val if key not found. */
+/* Get a config value. Returns default_val if key not found. Database-backed
+ * results remain valid until the next call on the same thread. */
 const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *default_val);
 
 /* Get a config value as bool. "true"/"1"/"on" → true. */
@@ -365,6 +373,53 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
+
+/* ── Binary activation safety ─────────────────────────────────── */
+
+typedef void *cbm_cli_activation_lock_t;
+typedef int (*cbm_cli_activation_mutation_fn)(void *context);
+
+/* High-level mutation reservation seam. Production maps this to the
+ * crash-safe version-cohort maintenance barrier, which requests bounded
+ * quiescence of active modern CBM processes before returning an exclusive
+ * lease. Tests use it to prove that mutation never runs before the cohort has
+ * drained. Return 1 with a non-NULL lease on success, 0 when participants did
+ * not drain before the deadline, or -1 on an unsafe/IO failure. */
+typedef int (*cbm_cli_activation_reserve_fn)(
+    void *context, cbm_cli_activation_lock_t *lease_out);
+typedef void (*cbm_cli_activation_release_fn)(
+    void *context, cbm_cli_activation_lock_t lease);
+
+/* Injectable high-level boundary for deterministic drain/mutation ordering
+ * tests. Production never acquires startup while asking participants to
+ * quiesce: a bootstrap participant may already retain it. Only after lifetime
+ * EX proves the cohort drained does production acquire startup, re-probe the
+ * daemon generation, and retain startup through mutation. Startup is released
+ * before the maintenance lease. */
+typedef struct {
+    void *context;
+    cbm_cli_activation_reserve_fn reserve_for_mutation;
+    cbm_cli_activation_release_fn mutation_lease_release;
+    void (*visible_diagnostic)(void *context, const char *message);
+} cbm_cli_activation_ops_t;
+
+/* Reserve and drain the coordinated cohort, run the mutation only while its
+ * lease is retained, then release it on every callback result. A NULL mutation
+ * is a guarded no-op. Returns 0 on success, 1 when activation is refused, or
+ * the mutation callback's non-zero error. */
+int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
+                                      cbm_cli_activation_mutation_fn mutation,
+                                      void *mutation_context);
+
+/* Internal test seam used only by the C suite to route install/update/uninstall
+ * through deterministic callbacks. NULL restores the production daemon IPC path. */
+void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
+
+/* Internal integration-test seam: isolate the stable endpoint beneath a
+ * private runtime parent. NULL restores the platform default. This is not a
+ * command-line or environment override. */
+void cbm_cli_set_activation_runtime_parent_for_test(
+    const char *runtime_parent);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
@@ -397,6 +452,27 @@ char *cbm_hook_augment_lifecycle_json(const char *input);
  * copilot_dialect is true, emits Copilot CLI's top-level additionalContext. */
 char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_event,
                                           bool copilot_dialect);
+
+/* Thin daemon frontend support: preserve the hook's bounded stdin read and
+ * hard fail-open deadline without constructing a local MCP/store instance. */
+void cbm_hook_augment_arm_deadline(void);
+char *cbm_hook_augment_read_stdin(void);
+
+/* Process one already-read hook payload using a caller-owned MCP session.
+ * Returns a malloc-owned hook output JSON string, or NULL for fail-open/no
+ * augmentation. This is the daemon entry; it never arms a process-global
+ * timer and never constructs a second store/session. */
+char *cbm_hook_augment_process(cbm_mcp_server_t *srv, const char *input_json);
+
+/* Dialect-aware daemon entry. forced_event and dialect_name are borrowed and
+ * may be NULL for the ordinary event dialect. Unsupported combinations fail
+ * open with NULL, matching the direct hook command. */
+bool cbm_hook_augment_invocation_supported(const char *forced_event,
+                                            const char *dialect_name);
+char *cbm_hook_augment_process_for(cbm_mcp_server_t *srv,
+                                   const char *input_json,
+                                   const char *forced_event,
+                                   const char *dialect_name);
 
 /* True for an absolute path the augmenter can walk up: POSIX "/..." or a
  * Windows drive root — "X:/..." or a bare "X:" (callers normalize '\\' to '/'

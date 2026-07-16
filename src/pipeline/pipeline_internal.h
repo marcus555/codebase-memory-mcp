@@ -631,6 +631,13 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
 
+/* Test seam: invoked after a complete staging DB is sealed and immediately
+ * before the cancellation check + atomic replace. Not part of the public API. */
+void cbm_pipeline_set_before_publish_hook_for_tests(
+    cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
+void cbm_pipeline_set_rename_hook_for_tests(
+    cbm_pipeline_t *p, int (*hook)(const char *, const char *, void *), void *ctx);
+
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client
  * suffix is present (the stub-type signal that gates Route emission, #294).

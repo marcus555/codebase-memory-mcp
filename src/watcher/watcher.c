@@ -44,6 +44,10 @@
 typedef struct {
     char *project_name;
     char *root_path;
+    /* poll_once snapshots retain state pointers after projects_lock is
+     * released. Unwatch/replacement tombstones a removed state so a later
+     * snapshot entry cannot admit new indexing work. */
+    atomic_bool registered;
     char last_head[CBM_SZ_64]; /* git HEAD hash (committed baseline) */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
@@ -70,6 +74,13 @@ struct cbm_watcher {
     void *user_data;
     CBMHashTable *projects; /* name → project_state_t* */
     cbm_mutex_t projects_lock;
+    /* Serializes callback replacement with the entire destructive prune
+     * transaction so a borrowed daemon context cannot be freed mid-callback. */
+    cbm_mutex_t coordination_lock;
+    cbm_watcher_project_mutation_begin_fn mutation_begin;
+    cbm_watcher_project_mutation_end_fn mutation_end;
+    cbm_watcher_project_pruned_fn project_pruned;
+    void *mutation_context;
     atomic_int stopped;
     /* Deferred-free list: freed after the next poll_once. */
     project_state_t **pending_free;
@@ -331,6 +342,8 @@ static int git_file_count(const char *root_path) {
 
 /* ── Project state lifecycle ────────────────────────────────────── */
 
+static void state_free(project_state_t *s);
+
 static project_state_t *state_new(const char *name, const char *root_path) {
     project_state_t *s = calloc(CBM_ALLOC_ONE, sizeof(*s));
     if (!s) {
@@ -338,6 +351,11 @@ static project_state_t *state_new(const char *name, const char *root_path) {
     }
     s->project_name = strdup(name);
     s->root_path = strdup(root_path);
+    if (!s->project_name || !s->root_path) {
+        state_free(s);
+        return NULL;
+    }
+    atomic_init(&s->registered, true);
     s->interval_ms = POLL_BASE_MS;
     return s;
 }
@@ -432,25 +450,63 @@ static const char *itoa_buf(int v) {
     return buf;
 }
 
-static void delete_cached_project_db(const char *project_name) {
+static bool watcher_unlink_cached_file(const char *project_name, const char *path,
+                                       const char *artifact) {
+    if (cbm_unlink(path) == 0 || errno == ENOENT) {
+        return true;
+    }
+    int unlink_errno = errno;
+    char errno_text[CBM_SZ_32];
+    snprintf(errno_text, sizeof(errno_text), "%d", unlink_errno);
+    cbm_log_warn("watcher.root_prune_delete_failed", "project", project_name,
+                 "artifact", artifact, "path", path, "errno", errno_text);
+    return false;
+}
+
+static bool delete_cached_project_db(const char *project_name) {
     if (!cbm_validate_project_name(project_name)) {
-        return;
+        return false;
     }
 
     const char *cache_dir = cbm_resolve_cache_dir();
     if (!cache_dir) {
-        return;
+        return false;
     }
 
-    char path[CBM_SZ_1K];
-    char wal[CBM_SZ_1K];
-    char shm[CBM_SZ_1K];
-    snprintf(path, sizeof(path), "%s/%s.db", cache_dir, project_name);
-    snprintf(wal, sizeof(wal), "%s-wal", path);
-    snprintf(shm, sizeof(shm), "%s-shm", path);
-    (void)cbm_unlink(path);
-    (void)cbm_unlink(wal);
-    (void)cbm_unlink(shm);
+    size_t cache_length = strlen(cache_dir);
+    size_t project_length = strlen(project_name);
+    if (cache_length > SIZE_MAX - project_length - sizeof("/.db")) {
+        return false;
+    }
+    size_t path_capacity = cache_length + project_length + sizeof("/.db");
+    char *path = malloc(path_capacity);
+    char *sidecar = malloc(path_capacity + sizeof("-wal"));
+    if (!path || !sidecar) {
+        free(path);
+        free(sidecar);
+        return false;
+    }
+    int written = snprintf(path, path_capacity, "%s/%s.db", cache_dir, project_name);
+    bool formatted = written > 0 && (size_t)written < path_capacity;
+    bool removed = formatted &&
+                   watcher_unlink_cached_file(project_name, path, "database");
+    /* If the main DB could not be removed, preserve WAL/SHM: together they
+     * may be the only recoverable committed generation. */
+    if (removed) {
+        written = snprintf(sidecar, path_capacity + sizeof("-wal"), "%s-wal", path);
+        removed = written > 0 &&
+                  (size_t)written < path_capacity + sizeof("-wal") &&
+                  watcher_unlink_cached_file(project_name, sidecar, "wal");
+    }
+    if (removed) {
+        written = snprintf(sidecar, path_capacity + sizeof("-wal"), "%s-shm", path);
+        removed = written > 0 &&
+                  (size_t)written < path_capacity + sizeof("-wal") &&
+                  watcher_unlink_cached_file(project_name, sidecar, "shm");
+    }
+    free(path);
+    free(sidecar);
+    return removed;
 }
 
 /* Hash table foreach callback to free state entries */
@@ -476,6 +532,7 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
         return NULL;
     }
     cbm_mutex_init(&w->projects_lock);
+    cbm_mutex_init(&w->coordination_lock);
     atomic_init(&w->stopped, 0);
     return w;
 }
@@ -487,6 +544,7 @@ void cbm_watcher_free(cbm_watcher_t *w) {
     /* Safety net: ensure stopped is set before draining pending_free.
      * In production the caller should cbm_watcher_stop() + join first. */
     atomic_store(&w->stopped, 1);
+    cbm_mutex_lock(&w->coordination_lock);
     cbm_mutex_lock(&w->projects_lock);
     cbm_ht_foreach(w->projects, free_state_entry, NULL);
     cbm_ht_free(w->projects);
@@ -495,8 +553,26 @@ void cbm_watcher_free(cbm_watcher_t *w) {
     }
     free(w->pending_free);
     cbm_mutex_unlock(&w->projects_lock);
+    cbm_mutex_unlock(&w->coordination_lock);
     cbm_mutex_destroy(&w->projects_lock);
+    cbm_mutex_destroy(&w->coordination_lock);
     free(w);
+}
+
+void cbm_watcher_set_project_mutation_guard(
+    cbm_watcher_t *w, cbm_watcher_project_mutation_begin_fn begin,
+    cbm_watcher_project_mutation_end_fn end, cbm_watcher_project_pruned_fn pruned,
+    void *context) {
+    if (!w) {
+        return;
+    }
+    cbm_mutex_lock(&w->coordination_lock);
+    bool valid = begin && end;
+    w->mutation_begin = valid ? begin : NULL;
+    w->mutation_end = valid ? end : NULL;
+    w->project_pruned = valid ? pruned : NULL;
+    w->mutation_context = valid ? context : NULL;
+    cbm_mutex_unlock(&w->coordination_lock);
 }
 
 /* ── Watch list management ──────────────────────────────────────── */
@@ -513,19 +589,33 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         return;
     }
 
-    /* Remove old entry first (key points to state's project_name) */
-    cbm_mutex_lock(&w->projects_lock);
-    project_state_t *old = cbm_ht_get(w->projects, project_name);
-    if (old) {
-        cbm_ht_delete(w->projects, project_name);
-        state_free(old);
-    }
-
     project_state_t *s = state_new(project_name, root_path);
     if (!s) {
-        cbm_mutex_unlock(&w->projects_lock);
         cbm_log_warn("watcher.watch.oom", "project", project_name, "path", root_path);
         return;
+    }
+
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *old = cbm_ht_get(w->projects, project_name);
+    if (old && strcmp(old->root_path, s->root_path) == 0) {
+        /* Multiple daemon sessions may subscribe to the same canonical
+         * project/root. Re-registering that identical watch must not discard
+         * its git baseline, pending dirty signature, or immediate-touch state. */
+        cbm_mutex_unlock(&w->projects_lock);
+        state_free(s);
+        return;
+    }
+    if (old) {
+        /* A poll snapshot may still be using the old state, including while
+         * its index callback calls back into this function. Queue it before
+         * removing the table entry; on OOM, preserve the existing watch. */
+        if (!defer_state_free(w, old)) {
+            cbm_mutex_unlock(&w->projects_lock);
+            state_free(s);
+            return;
+        }
+        atomic_store_explicit(&old->registered, false, memory_order_release);
+        cbm_ht_delete(w->projects, project_name);
     }
     cbm_ht_set(w->projects, s->project_name, s);
     cbm_mutex_unlock(&w->projects_lock);
@@ -542,6 +632,7 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
     if (s && defer_state_free(w, s)) {
         /* The entry leaves the table only once its state is safely on
          * the deferred-free list; on OOM the watch stays registered. */
+        atomic_store_explicit(&s->registered, false, memory_order_release);
         cbm_ht_delete(w->projects, project_name);
         removed = true;
     }
@@ -656,32 +747,72 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
         return;
     }
 
-    char project_name[CBM_SZ_1K];
-    snprintf(project_name, sizeof(project_name), "%s", s->project_name);
+    char *project_name = cbm_strdup(s->project_name);
+    char *root_path = cbm_strdup(s->root_path);
+    if (!project_name || !root_path) {
+        free(project_name);
+        free(root_path);
+        return;
+    }
 
     bool removed = false;
+    cbm_mutex_lock(&w->coordination_lock);
+    bool mutation_acquired = !w->mutation_begin ||
+                             w->mutation_begin(w->mutation_context, project_name);
+    if (!mutation_acquired) {
+        cbm_mutex_unlock(&w->coordination_lock);
+        free(project_name);
+        free(root_path);
+        return;
+    }
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *current = cbm_ht_get(w->projects, project_name);
     /* Deferred free (same discipline as cbm_watcher_unwatch): this state
      * is referenced by the poll_once snapshot iterating us. On OOM the
-     * watch stays registered and pruning retries on the next cycle. */
-    if (current == s && defer_state_free(w, s)) {
-        delete_cached_project_db(project_name);
-        cbm_ht_delete(w->projects, project_name);
-        removed = true;
+     * watch stays registered and pruning retries on the next cycle. Re-stat
+     * under the mutation lease so a root restored after the poll snapshot is
+     * never pruned. */
+    int stat_errno = 0;
+    uint64_t now_ms = cbm_now_ms();
+    bool still_eligible = current == s && strcmp(current->root_path, root_path) == 0 &&
+                          current->missing_root_count >= MISSING_ROOT_DELETE_AFTER &&
+                          current->first_missing_ms > 0 &&
+                          now_ms - current->first_missing_ms >=
+                              (uint64_t)prune_grace_s() * CBM_MSEC_PER_SEC &&
+                          root_status(root_path, &stat_errno) == ROOT_MISSING;
+    if (still_eligible && defer_state_free(w, s)) {
+        if (delete_cached_project_db(project_name)) {
+            atomic_store_explicit(&s->registered, false, memory_order_release);
+            cbm_ht_delete(w->projects, project_name);
+            removed = true;
+        } else {
+            /* The state stays registered; undo the just-added deferred-free
+             * entry so the next poll can safely retry the failed deletion. */
+            w->pending_free[--w->pending_free_count] = NULL;
+        }
     }
     cbm_mutex_unlock(&w->projects_lock);
+
+    if (removed && w->project_pruned) {
+        w->project_pruned(w->mutation_context, project_name);
+    }
+    if (w->mutation_begin) {
+        w->mutation_end(w->mutation_context, project_name);
+    }
+    cbm_mutex_unlock(&w->coordination_lock);
 
     if (removed) {
         cbm_log_info("watcher.root_pruned", "project", project_name);
     }
+    free(project_name);
+    free(root_path);
 }
 
 static void poll_project(const char *key, void *val, void *ud) {
     (void)key;
     poll_ctx_t *ctx = ud;
     project_state_t *s = val;
-    if (!s) {
+    if (!s || !atomic_load_explicit(&s->registered, memory_order_acquire)) {
         return;
     }
 
@@ -747,6 +878,12 @@ static void poll_project(const char *key, void *val, void *ud) {
     }
 
     /* Trigger reindex */
+    if (!atomic_load_explicit(&s->registered, memory_order_acquire)) {
+        /* Git inspection can take long enough for the final owning daemon
+         * session to disconnect. Unwatch tombstones the snapshot state; do
+         * not admit an index callback after that ownership boundary. */
+        return;
+    }
     cbm_log_info("watcher.changed", "project", s->project_name, "strategy", "git");
     if (ctx->w->index_fn) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);

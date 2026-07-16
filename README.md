@@ -102,6 +102,18 @@ The `install` command automatically strips macOS quarantine attributes and ad-ho
 
 The `install` command auto-detects installed coding agents and configures their documented MCP entries plus durable instructions, skills, and lifecycle hooks where supported.
 
+### Session Coordination Daemon
+
+CBM automatically shares one per-account coordination daemon across Claude Code, Codex, OpenCode, and every other configured client. There is no opt-in setting for MCP servers or hook clients: the first daemon-backed CBM session starts it, each session registers its own work, and the final session shuts it down. The daemon owns long-lived background services such as watchers, shared indexing jobs, and the optional UI. Closing one session cancels work owned only by that session, while work still needed by another session continues.
+
+All active CBM processes must run the exact same version, executable build, and coordination ABI. MCP servers, hooks, one-shot CLI commands, temporary index workers, and the daemon share a crash-safe OS admission barrier; starting an ordinary newer or older CBM process while another build is active fails before doing work and records an explicit conflict in `daemon-conflicts.ndjson` in the private log directory.
+
+The native `install`, `update`, and `uninstall` commands are the deliberate exception to that conflict rule. Download, verification, and private same-filesystem staging happen first so a bad candidate never disrupts active work. Activation then publishes account-wide maintenance intent, asks the daemon and every temporary local operation to cancel, and waits to a finite deadline for all coordinated CBM processes to exit. It holds the admission and lifetime barriers exclusively while changing the active binary, configuration, PATH, or indexes. New CBM work cannot enter during this window. Activation progress and results are recorded in the private `activation-events.ndjson` log, and a successful command tells you to restart open coding-agent sessions so they launch the activated build.
+
+Package-manager setup (npm, PyPI, or Go) only verifies and atomically publishes that package's private cached binary; it does not replace the active native installation and therefore does not stop running CBM sessions. When that cached binary is executed, it still enters the same exact-build admission barrier. The shell and PowerShell installers invoke the verified candidate's native `install` command, so they do receive the full account-wide activation guarantee.
+
+The ordinary `cli` mode is intentionally separate: it runs one command locally and never starts or connects to the coordination daemon, registers a daemon session, or starts watchers/UI. Its only shared state is the OS admission barrier plus per-project locks for graph mutations. While the command is running, a temporary monitor lets activation cancel that operation and its supervised worker safely; the monitor exits with the command and never becomes a standing daemon. See [CLI Mode](#cli-mode) for details.
+
 ### Graph Visualization UI
 
 The UI ships as a separate `ui` build (it embeds the frontend). The default install on every channel is the lean, headless server; opt into the UI build with:
@@ -117,7 +129,7 @@ Then run it:
 codebase-memory-mcp --ui=true --port=9749
 ```
 
-Open `http://localhost:9749` in your browser. The UI runs as a background thread alongside the MCP server — it's available whenever your agent is connected.
+Open `http://localhost:9749` in your browser. The UI is owned by the shared coordination daemon, so concurrent agent sessions do not start duplicate HTTP servers.
 
 ### Auto-Index
 
@@ -521,18 +533,29 @@ no longer a suitable automatic global target.
 
 ## CLI Mode
 
-Every MCP tool can be invoked from the command line:
+Every MCP tool can be invoked as a local, one-shot command. CLI tools neither start nor connect to the coordination daemon and leave no standing process behind. They hold a crash-safe exact-build admission lease only for the command lifetime. `index_repository` is the only exception internally: it starts a temporary, exact-build supervised worker for the index, then stops that worker before the CLI command exits; the worker holds its own lease until exit.
+
+Commands that mutate graph data use shared OS-backed, per-project locks. This serializes conflicting work from CLI and MCP sessions on the same project while allowing unrelated projects to proceed independently.
+
+When stderr is an interactive terminal, the CLI automatically shows lifecycle and indexing progress. Pass `--progress` to force the same feedback when stderr is redirected or the command is run non-interactively. Progress is written only to stderr; stdout remains reserved for the command result, so pipes and scripts stay machine-safe. Pass `--json` when the full MCP result envelope is needed.
+
+Use `cli <tool> --help` to see the flags generated from that tool's input schema:
 
 ```bash
-codebase-memory-mcp cli index_repository '{"repo_path": "/path/to/repo"}'
+codebase-memory-mcp cli index_repository --repo-path /path/to/repo
 codebase-memory-mcp cli list_projects
 
 # Use the "name" returned by list_projects as the project value.
-codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*", "label": "Function"}'
-codebase-memory-mcp cli trace_path '{"project": "my-project", "function_name": "Search", "direction": "both"}'
-codebase-memory-mcp cli query_graph '{"project": "my-project", "query": "MATCH (f:Function) RETURN f.name LIMIT 5"}'
-codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "Function"}' | jq '.results[].name'
+codebase-memory-mcp cli search_graph --project my-project --name-pattern '.*Handler.*' --label Function
+codebase-memory-mcp cli trace_path --project my-project --function-name Search --direction both
+codebase-memory-mcp cli query_graph --project my-project --query 'MATCH (f:Function) RETURN f.name LIMIT 5'
+
+# Force human-readable progress without contaminating stdout.
+codebase-memory-mcp cli --progress index_repository --repo-path /path/to/repo
+codebase-memory-mcp cli search_graph --project my-project --label Function | jq '.results[].name'
 ```
+
+JSON arguments can also be piped on stdin. Inline JSON remains accepted for backward compatibility but is deprecated in favor of flags, `--args-file`, or stdin.
 
 ## MCP Tools
 
@@ -706,6 +729,7 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 ```
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
+  daemon/             Per-account session coordination, IPC, lifecycle, shared jobs/watchers
   mcp/                MCP server (15 tools, JSON-RPC 2.0, session detection, auto-index)
   cli/                Install/uninstall/update/config (43 client surfaces, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)

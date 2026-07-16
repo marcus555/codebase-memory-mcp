@@ -183,7 +183,20 @@ TEST(dump_install_ignores_stale_wal_sidecar) {
     PASS();
 }
 
+TEST(remove_db_sidecars_rejects_truncated_suffix_path) {
+    /* The implementation's sidecar buffer is 4096 bytes. Before the fix,
+     * snprintf truncation simply skipped every unlink and still returned
+     * success, violating the helper's fail-closed contract. */
+    char db_path[4096];
+    memset(db_path, 'x', sizeof(db_path) - 1);
+    db_path[sizeof(db_path) - 1] = '\0';
+
+    ASSERT_TRUE(cbm_remove_db_sidecars(db_path) != 0);
+    PASS();
+}
+
 SUITE(store_checkpoint) {
     RUN_TEST(checkpoint_does_not_truncate_wal);
     RUN_TEST(dump_install_ignores_stale_wal_sidecar);
+    RUN_TEST(remove_db_sidecars_rejects_truncated_suffix_path);
 }

@@ -5,10 +5,13 @@
  * proximity, diffuse, corpus lifecycle, get_config.
  */
 #include "test_framework.h"
+#include "../src/foundation/compat.h"
+#include "../src/foundation/compat_thread.h"
 #include <semantic/rotsq.h>
 #include <semantic/semantic.h>
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -341,6 +344,63 @@ TEST(sem_get_config_defaults) {
 
 /* ── RaBitQ estimator quality (from-paper 4-bit quantization) ────── */
 
+typedef struct {
+    atomic_int *ready;
+    atomic_int *start;
+    float value;
+    cbm_rsq_code_t code;
+} rotsq_thread_ctx_t;
+
+static void *rotsq_concurrent_first_encode(void *opaque) {
+    rotsq_thread_ctx_t *ctx = opaque;
+    float vec[CBM_RSQ_IN_DIM];
+    for (int i = 0; i < CBM_RSQ_IN_DIM; i++) {
+        vec[i] = ctx->value + (float)i / (float)CBM_RSQ_IN_DIM;
+    }
+    atomic_fetch_add_explicit(ctx->ready, 1, memory_order_release);
+    while (atomic_load_explicit(ctx->start, memory_order_acquire) == 0) {
+        cbm_usleep(1000);
+    }
+    cbm_rsq_encode(vec, &ctx->code);
+    return NULL;
+}
+
+/* The daemon can initialize semantic encoders from multiple request threads.
+ * Run this first so ThreadSanitizer observes the one-time initialization. */
+TEST(sem_rotsq_concurrent_first_encode) {
+    atomic_int ready;
+    atomic_int start;
+    atomic_init(&ready, 0);
+    atomic_init(&start, 0);
+    rotsq_thread_ctx_t ctx[2] = {
+        {.ready = &ready, .start = &start, .value = 0.25F},
+        {.ready = &ready, .start = &start, .value = -0.5F},
+    };
+    cbm_thread_t threads[2];
+    bool started0 = cbm_thread_create(&threads[0], 0, rotsq_concurrent_first_encode, &ctx[0]) == 0;
+    bool started1 = cbm_thread_create(&threads[1], 0, rotsq_concurrent_first_encode, &ctx[1]) == 0;
+    for (int spins = 0; started0 && started1 && spins < 5000 &&
+                        atomic_load_explicit(&ready, memory_order_acquire) < 2;
+         spins++) {
+        cbm_usleep(1000);
+    }
+    bool both_ready = atomic_load_explicit(&ready, memory_order_acquire) == 2;
+    atomic_store_explicit(&start, 1, memory_order_release);
+    if (started0) {
+        (void)cbm_thread_join(&threads[0]);
+    }
+    if (started1) {
+        (void)cbm_thread_join(&threads[1]);
+    }
+
+    ASSERT_TRUE(started0);
+    ASSERT_TRUE(started1);
+    ASSERT_TRUE(both_ready);
+    ASSERT_TRUE(ctx[0].code.scale > 0.0F);
+    ASSERT_TRUE(ctx[1].code.scale > 0.0F);
+    PASS();
+}
+
 /* Deterministic pseudo-random unit vectors; validates that the quantized
  * inner-product estimator tracks the exact float IP within tight bounds.
  * These bounds gate the semantic pass's use of the codes: cosine scores are
@@ -400,6 +460,7 @@ TEST(sem_rotsq_ip_error_bounds) {
 /* ── Suite ───────────────────────────────────────────────────────── */
 
 SUITE(semantic) {
+    RUN_TEST(sem_rotsq_concurrent_first_encode);
     RUN_TEST(sem_rotsq_ip_error_bounds);
     RUN_TEST(sem_tokenize_camel);
     RUN_TEST(sem_tokenize_snake);
