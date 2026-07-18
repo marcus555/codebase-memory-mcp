@@ -1984,14 +1984,13 @@ static int posix_socket_record_publication_recover(
 
 static int posix_linkat_no_follow(int source_dir_fd, const char *source_name,
                                   int destination_dir_fd, const char *destination_name) {
-    int flags = 0;
-#if defined(__APPLE__) && defined(AT_SYMLINK_NOFOLLOW_ANY)
-    /* Darwin documents that linkat(..., 0) may be rejected by some
-     * filesystems. This explicit flag preserves the intended no-follow
-     * semantics while making the operation portable to those filesystems. */
-    flags = AT_SYMLINK_NOFOLLOW_ANY;
-#endif
-    return linkat(source_dir_fd, source_name, destination_dir_fd, destination_name, flags);
+    /* linkat without AT_SYMLINK_FOLLOW links the source entry itself, which is
+     * the required no-follow behavior.  Do not pass Darwin's broader
+     * AT_SYMLINK_NOFOLLOW_ANY constant: macOS 14 headers define it, but that
+     * kernel rejects it for linkat with EINVAL.  The retained and validated
+     * source state plus post-link inode/link-count checks retain the
+     * fail-closed publication contract. */
+    return linkat(source_dir_fd, source_name, destination_dir_fd, destination_name, 0);
 }
 
 static void posix_bound_socket_unlink_if_matches(int dir_fd, const char *socket_name, dev_t device,

@@ -115,16 +115,16 @@ jobs:
         run: |
           scripts/build.sh CC=clang CXX=clang++
           # MSYS2 /tmp is intentionally shared. The launcher correctly rejects
-          # a bundle below that writable ancestor, so stage in the runner's
-          # account-private native temp directory instead.
-          SMOKE_ROOT="$(cygpath -u "$RUNNER_TEMP")"
-          SMOKE_DIR="$(mktemp -d "$SMOKE_ROOT/cbm-pr-smoke.XXXXXX")"
+          # a bundle below that writable ancestor. RUNNER_TEMP is also below
+          # the shared D:\a tree, so stage in the runner account's profile.
+          PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
+          SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-pr-smoke.XXXXXX")"
           trap 'rm -rf "$SMOKE_DIR"' EXIT
           cp build/c/codebase-memory-mcp-launcher.exe \
             "$SMOKE_DIR/codebase-memory-mcp.exe"
           cp build/c/codebase-memory-mcp.exe \
             "$SMOKE_DIR/codebase-memory-mcp.payload.exe"
-          SMOKE_TEMP_ROOT="$SMOKE_ROOT" \
+          SMOKE_TEMP_ROOT="$SMOKE_DIR" \
             scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"
 
   ci-ok:

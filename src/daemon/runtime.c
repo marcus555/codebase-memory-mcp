@@ -1354,8 +1354,8 @@ static bool runtime_activation_peer_matches_claim(cbm_daemon_runtime_service_t *
     }
     bool active_image =
         runtime_process_image_reference_matches_process(&service->active_image, process_id);
-    if (active_image && strcmp(claimed_build, service->identity.build_fingerprint) == 0) {
-        return true;
+    if (active_image) {
+        return strcmp(claimed_build, service->identity.build_fingerprint) == 0;
     }
     char peer_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     return cbm_daemon_runtime_process_build_fingerprint(process_id, peer_fingerprint) &&
@@ -1569,7 +1569,6 @@ static void *runtime_connection_worker(void *opaque) {
         received = cbm_daemon_ipc_receive_frame(worker->connection, CBM_DAEMON_IPC_WAIT_FOREVER,
                                                 &frame, &payload);
         if (received != 1 || frame.type != CBM_DAEMON_FRAME_REQUEST) {
-            free(payload);
             break;
         }
         switch (frame.flags) {

@@ -397,6 +397,88 @@ def assert_untrusted_ancestor_acl_rejected(
     print("PASS: launcher rejected an untrusted mutation ACE on an ancestor")
 
 
+def assert_add_only_ancestor_acl_allowed(source_launcher, source_payload, env, work):
+    ancestor = work / "cross-account add-only ancestor"
+    launcher, _ = copy_portable_pair(source_launcher, source_payload, ancestor / "bundle")
+    grant = run(["icacls", ancestor, "/grant", "*S-1-1-0:(AD)"], env)
+    require(
+        grant.returncode == 0,
+        "could not install native Everyone-add-subdirectory ancestor fixture: %s"
+        % output_text(grant)[-600:],
+    )
+    try:
+        for candidate, spelling in (
+            (launcher, "normal"),
+            ("\\\\?\\" + str(launcher.resolve()), "extended DOS"),
+        ):
+            result = run([candidate, "--version"], env)
+            require(
+                result.returncode == 0,
+                "%s launcher path treated sibling creation as replacement access: %s"
+                % (spelling, output_text(result)[-600:]),
+            )
+    finally:
+        remove = run(["icacls", ancestor, "/remove:g", "*S-1-1-0"], env)
+        require(
+            remove.returncode == 0,
+            "could not remove native Everyone-add-subdirectory ancestor fixture",
+        )
+    print("PASS: launcher allowed add-only sibling creation without weakening path integrity")
+
+
+def assert_targeted_ancestor_acl_rejected(path, launcher, right, description, env):
+    grant = run(["icacls", path, "/grant", "*S-1-1-0:(%s)" % right], env)
+    require(
+        grant.returncode == 0,
+        "could not install native Everyone-%s fixture: %s"
+        % (description, output_text(grant)[-600:]),
+    )
+    try:
+        for candidate, spelling in (
+            (launcher, "normal"),
+            ("\\\\?\\" + str(launcher.resolve()), "extended DOS"),
+        ):
+            result = run([candidate, "--version"], env)
+            require(
+                result.returncode != 0,
+                "%s launcher accepted cross-account %s"
+                % (spelling, description),
+            )
+    finally:
+        remove = run(["icacls", path, "/remove:g", "*S-1-1-0"], env)
+        require(
+            remove.returncode == 0,
+            "could not remove native Everyone-%s fixture" % description,
+        )
+    require(
+        run([launcher, "--version"], env).returncode == 0,
+        "launcher did not recover after the %s ACE was removed" % description,
+    )
+
+
+def assert_file_add_and_executable_parent_acl_rejected(
+    source_launcher, source_payload, env, work
+):
+    file_add_ancestor = work / "cross-account file-add ancestor"
+    launcher, _ = copy_portable_pair(
+        source_launcher, source_payload, file_add_ancestor / "bundle"
+    )
+    assert_targeted_ancestor_acl_rejected(
+        file_add_ancestor, launcher, "WD", "file creation on an intermediate ancestor", env
+    )
+
+    executable_parent = work / "cross-account executable parent"
+    launcher, _ = copy_portable_pair(source_launcher, source_payload, executable_parent)
+    assert_targeted_ancestor_acl_rejected(
+        executable_parent,
+        launcher,
+        "AD",
+        "subdirectory creation beside the executable",
+        env,
+    )
+    print("PASS: launcher kept file-add and executable-parent ACL boundaries strict")
+
+
 def process_entries():
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -979,6 +1061,12 @@ def main():
         env, cache = isolated_environment(work)
         assert_release_descriptor(source_launcher, source_payload, env, cache)
         assert_portable_mutations_refuse(source_payload, env, cache, work)
+        assert_add_only_ancestor_acl_allowed(
+            source_launcher, source_payload, env, work
+        )
+        assert_file_add_and_executable_parent_acl_rejected(
+            source_launcher, source_payload, env, work
+        )
         assert_untrusted_ancestor_acl_rejected(
             source_launcher, source_payload, env, work
         )

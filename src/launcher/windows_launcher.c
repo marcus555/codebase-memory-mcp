@@ -176,7 +176,7 @@ static bool launcher_bounded_ace_sid_is_trusted(const ACE_HEADER *header, PSID c
              IsWellKnownSid((PSID)sid, WinCreatorOwnerSid)));
 }
 
-static bool launcher_security_is_safe(HANDLE file, bool require_current_owner) {
+static bool launcher_security_is_safe(HANDLE file, bool require_current_owner, DWORD mutation) {
     void *token_user = NULL;
     PSID user_sid = NULL;
     if (!launcher_current_user(&token_user, &user_sid)) {
@@ -196,10 +196,6 @@ static bool launcher_security_is_safe(HANDLE file, bool require_current_owner) {
                                : launcher_sid_is_trusted(owner, user_sid)) &&
         dacl && IsValidAcl(dacl) &&
         GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation) != 0;
-    const DWORD mutation = GENERIC_ALL | GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
-                           FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD |
-                           FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC |
-                           WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
     for (DWORD index = 0; secure && index < information.AceCount; index++) {
         void *opaque = NULL;
         if (!GetAce(dacl, index, &opaque) || !opaque) {
@@ -239,8 +235,14 @@ static bool launcher_security_is_safe(HANDLE file, bool require_current_owner) {
     return secure;
 }
 
+static DWORD launcher_private_mutation_rights(void) {
+    return GENERIC_ALL | GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_ADD_FILE |
+           FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
+           DELETE | WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
+}
+
 static bool launcher_security_is_private(HANDLE file) {
-    return launcher_security_is_safe(file, true);
+    return launcher_security_is_safe(file, true, launcher_private_mutation_rights());
 }
 
 static HANDLE launcher_open_regular(const wchar_t *path, DWORD access, bool require_private) {
@@ -319,11 +321,20 @@ static bool launcher_path_tree_plain(const wchar_t *file_path) {
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         BY_HANDLE_FILE_INFORMATION information;
+        DWORD mutation = launcher_private_mutation_rights();
+        if (index < directory_length) {
+            /* Default C:\\Users ACLs grant cross-account add-subdirectory on
+             * this intermediate component. That cannot replace the existing
+             * next component. No other write right is relaxed, and the final
+             * executable directory remains fully private so a peer cannot
+             * plant DLL or .exe.local redirection artifacts beside CBM. */
+            mutation &= ~((DWORD)FILE_ADD_SUBDIRECTORY);
+        }
         valid = component != INVALID_HANDLE_VALUE && GetFileType(component) == FILE_TYPE_DISK &&
                 GetFileInformationByHandle(component, &information) != 0 &&
                 (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
                 (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-                launcher_security_is_safe(component, false);
+                launcher_security_is_safe(component, false, mutation);
         if (component != INVALID_HANDLE_VALUE)
             (void)CloseHandle(component);
         path[index] = saved;

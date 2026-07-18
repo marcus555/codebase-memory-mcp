@@ -3083,7 +3083,9 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   # Pass the known-correct arch: powershell runs under x64 emulation on ARM64, so
   # install.ps1's own detection can't tell it's arm64. DL_ARCH is authoritative here.
   HOME="$PS1_TEST_HOME" CBM_DOWNLOAD_URL="$WIN_URL" CBM_ARCH="$DL_ARCH" \
-    powershell.exe -ExecutionPolicy ByPass -File "$WIN_SCRIPT" "--dir=$WIN_DIR" 2>&1 || true
+    powershell.exe -NoProfile -ExecutionPolicy ByPass -Command \
+      '$env:TEMP=$args[0]; $env:TMP=$args[0]; & $args[1] $args[2]' \
+      "$WIN_HOME" "$WIN_SCRIPT" "--dir=$WIN_DIR" 2>&1 || true
 
   # 13g: binary placed
   PS1_BIN="$PS1_TEST_DIR/codebase-memory-mcp.exe"

@@ -349,6 +349,20 @@ require(
     in windows_test_driver,
     "the permanent-launcher guard must fail instead of skip on driver/precondition errors",
 )
+require(
+    all(
+        needle in windows_test_driver
+        for needle in (
+            "[Environment+SpecialFolder]::LocalApplicationData",
+            '$guardRoot = Join-Path $localAppData "Temp"',
+            '$env:TEMP = $guardRoot',
+            '$env:TMP = $guardRoot',
+            '$env:TMPDIR = $guardRoot',
+        )
+    ),
+    "Windows launcher guards must keep staged and Python-created fixtures "
+    "beneath the current account profile",
+)
 
 # Launcher supervision has two distinct failure directions: killing the
 # launcher must kill its payload job, and killing only the launcher's immediate
@@ -423,7 +437,13 @@ ancestor_security_contracts = {
         "FILE_FLAG_OPEN_REPARSE_POINT",
     ),
     "src/launcher/windows_launcher.c": (
-        "launcher_security_is_safe(component, false)",
+        "launcher_security_is_safe(component, false, mutation)",
+        "launcher_private_mutation_rights()",
+        "if (index < directory_length)",
+        "mutation &= ~((DWORD)FILE_ADD_SUBDIRECTORY)",
+        "FILE_ADD_FILE",
+        "FILE_DELETE_CHILD",
+        "DLL or .exe.local",
         "ACCESS_SYSTEM_SECURITY",
         "956008885U",
         "FILE_FLAG_OPEN_REPARSE_POINT",
@@ -448,10 +468,7 @@ windows_match = re.search(
 windows_smoke = windows_match.group(1) if windows_match else ""
 require(bool(windows_smoke), "_smoke.yml must contain the smoke-windows job")
 require(
-    re.search(
-        r"scripts/smoke-test\.sh\s+(?:\"|')?\./codebase-memory-mcp\.exe(?:\"|')?",
-        windows_smoke,
-    ) is not None,
+    'scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"' in windows_smoke,
     f"Windows release smoke must execute the canonical {launcher}",
 )
 require(
@@ -466,13 +483,62 @@ require(
 windows_release_smoke_blocks = [
     re.sub(r"\s+", " ", re.sub(r"\\\s*\n\s*", " ", block)).strip()
     for block in smoke_blocks
-    if "scripts/smoke-test.sh ./codebase-memory-mcp.exe" in block
+    if 'scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"' in block
 ]
 require(
     len(windows_release_smoke_blocks) == 1
-    and 'SMOKE_TEMP_ROOT="$(cygpath -u "$RUNNER_TEMP")" '
-    'scripts/smoke-test.sh ./codebase-memory-mcp.exe' in windows_release_smoke_blocks[0],
-    "Windows release smoke must keep every launcher fixture under runner-private temp",
+    and all(
+        needle in windows_release_smoke_blocks[0]
+        for needle in (
+            'PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"',
+            'SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-smoke.XXXXXX")"',
+            'cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe "$SMOKE_DIR/"',
+            'SMOKE_TEMP_ROOT="$SMOKE_DIR" '
+            'scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"',
+        )
+    ),
+    "Windows release smoke must keep every launcher fixture beneath the current account profile",
+)
+windows_release_version_blocks = [
+    re.sub(r"\s+", " ", re.sub(r"\\\s*\n\s*", " ", block)).strip()
+    for block in smoke_blocks
+    if 'LAUNCH_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-version.XXXXXX")"' in block
+]
+require(
+    len(windows_release_version_blocks) == 1
+    and all(
+        needle in windows_release_version_blocks[0]
+        for needle in (
+            'PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"',
+            'cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe "$LAUNCH_DIR/"',
+            '"$LAUNCH_DIR/codebase-memory-mcp.payload.exe" --version',
+            '"$LAUNCH_DIR/codebase-memory-mcp.exe" --version',
+        )
+    ),
+    "Windows release version checks must execute the pair beneath the current account profile",
+)
+require(
+    "$RUNNER_TEMP" not in windows_smoke,
+    "Windows release smoke must not treat GitHub's shared RUNNER_TEMP ancestry as private",
+)
+windows_release_security_blocks = [
+    re.sub(r"\s+", " ", re.sub(r"\\\s*\n\s*", " ", block)).strip()
+    for block in smoke_blocks
+    if 'scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp.exe"' in block
+]
+require(
+    len(windows_release_security_blocks) == 1
+    and all(
+        needle in windows_release_security_blocks[0]
+        for needle in (
+            'PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"',
+            'SECURITY_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-security.XXXXXX")"',
+            'cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe "$SECURITY_DIR/"',
+            'TMPDIR="$SECURITY_DIR" '
+            'scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp.exe"',
+        )
+    ),
+    "Windows release install audit must execute the pair beneath the current account profile",
 )
 
 # Native update transport remains HTTPS-only in production. Release smoke may
@@ -491,6 +557,11 @@ require(
     and 'UPDATE_DOWNLOAD_URL="file:///$UPDATE_FIXTURE_DIR"' in smoke_script
     and 'CBM_DOWNLOAD_URL="$UPDATE_DOWNLOAD_URL"' in smoke_script,
     "Phase 14 native update must use an explicit file:// fixture override",
+)
+require(
+    "'$env:TEMP=$args[0]; $env:TMP=$args[0]; & $args[1] $args[2]'" in smoke_script
+    and '"$WIN_HOME" "$WIN_SCRIPT" "--dir=$WIN_DIR"' in smoke_script,
+    "Windows install.ps1 smoke must set native TEMP/TMP inside PowerShell",
 )
 require(
     'CBM_DOWNLOAD_URL="$SMOKE_DOWNLOAD_URL"' in smoke_script
@@ -562,21 +633,21 @@ if pr_windows_blocks:
     pr_windows_block = re.sub(r"\\\s*\n\s*", " ", pr_windows_blocks[0])
     pr_windows_block = re.sub(r"\s+", " ", pr_windows_block).strip()
     staging_steps = (
-        'SMOKE_ROOT="$(cygpath -u "$RUNNER_TEMP")"',
-        'SMOKE_DIR="$(mktemp -d "$SMOKE_ROOT/cbm-pr-smoke.XXXXXX")"',
+        'PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"',
+        'SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-pr-smoke.XXXXXX")"',
         'trap \'rm -rf "$SMOKE_DIR"\' EXIT',
         'cp build/c/codebase-memory-mcp-launcher.exe '
         '"$SMOKE_DIR/codebase-memory-mcp.exe"',
         'cp build/c/codebase-memory-mcp.exe '
         '"$SMOKE_DIR/codebase-memory-mcp.payload.exe"',
-        'SMOKE_TEMP_ROOT="$SMOKE_ROOT" '
+        'SMOKE_TEMP_ROOT="$SMOKE_DIR" '
         'scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"',
     )
     positions = [pr_windows_block.find(step) for step in staging_steps]
     require(
         all(position >= 0 for position in positions),
         "Windows PR smoke must stage launcher and payload under release names "
-        "in the runner-private native temp directory and invoke the canonical launcher",
+        "beneath the current account profile and invoke the canonical launcher",
     )
     require(
         all(left < right for left, right in zip(positions, positions[1:])),
@@ -585,6 +656,10 @@ if pr_windows_blocks:
     require(
         pr_windows_block.count("scripts/smoke-test.sh") == 1,
         "Windows PR smoke must invoke smoke-test exactly once through the launcher",
+    )
+    require(
+        "$RUNNER_TEMP" not in pr_windows_block,
+        "Windows PR smoke must not treat GitHub's shared RUNNER_TEMP ancestry as private",
     )
 
 if failures:

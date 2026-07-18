@@ -213,8 +213,12 @@ jobs:
           unzip -o "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip"
           test -s codebase-memory-mcp.exe
           test -s codebase-memory-mcp.payload.exe
-          ./codebase-memory-mcp.payload.exe --version
-          ./codebase-memory-mcp.exe --version
+          PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
+          LAUNCH_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-version.XXXXXX")"
+          trap 'rm -rf "$LAUNCH_DIR"' EXIT
+          cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe "$LAUNCH_DIR/"
+          "$LAUNCH_DIR/codebase-memory-mcp.payload.exe" --version
+          "$LAUNCH_DIR/codebase-memory-mcp.exe" --version
 
       - name: Start artifact server
         shell: msys2 {0}
@@ -240,8 +244,12 @@ jobs:
       - name: Smoke test
         shell: msys2 {0}
         run: |
-          SMOKE_TEMP_ROOT="$(cygpath -u "$RUNNER_TEMP")" \
-            scripts/smoke-test.sh ./codebase-memory-mcp.exe
+          PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
+          SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-smoke.XXXXXX")"
+          trap 'rm -rf "$SMOKE_DIR"' EXIT
+          cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe "$SMOKE_DIR/"
+          SMOKE_TEMP_ROOT="$SMOKE_DIR" \
+            scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"
         env:
           SMOKE_DOWNLOAD_URL: http://127.0.0.1:18080
           SMOKE_UPDATE_FIXTURE_DIR: /tmp/smoke-server
@@ -252,7 +260,12 @@ jobs:
         run: |
           scripts/security-strings.sh ./codebase-memory-mcp.exe
           scripts/security-strings.sh ./codebase-memory-mcp.payload.exe
-          scripts/security-install.sh ./codebase-memory-mcp.exe
+          PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
+          SECURITY_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-security.XXXXXX")"
+          trap 'rm -rf "$SECURITY_DIR"' EXIT
+          cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe "$SECURITY_DIR/"
+          TMPDIR="$SECURITY_DIR" \
+            scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp.exe"
 
       - name: Windows Defender scan
         shell: pwsh

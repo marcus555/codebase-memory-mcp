@@ -133,7 +133,11 @@ Write-Host "Payload: $bin" -ForegroundColor Green
 Write-Host "Launcher: $launcherBin" -ForegroundColor Green
 Write-Host "ABI mismatch fixture: $abiMismatchLauncher" -ForegroundColor Green
 
-$guardBundle = Join-Path $tmp ("cbm-windows-guards-" + [guid]::NewGuid().ToString("N"))
+$localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+if (-not $localAppData) { throw "could not resolve the current user's local application-data directory" }
+$guardRoot = Join-Path $localAppData "Temp"
+New-Item -ItemType Directory -Path $guardRoot -Force | Out-Null
+$guardBundle = Join-Path $guardRoot ("cbm-windows-guards-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $guardBundle | Out-Null
 $guardBin = Join-Path $guardBundle "codebase-memory-mcp.exe"
 $guardPayload = Join-Path $guardBundle "codebase-memory-mcp.payload.exe"
@@ -141,7 +145,15 @@ Copy-Item -LiteralPath $launcherBin -Destination $guardBin
 Copy-Item -LiteralPath $bin -Destination $guardPayload
 Write-Host "Guard bundle: $guardBin" -ForegroundColor Green
 
+$previousTemp = $env:TEMP
+$previousTmp = $env:TMP
+$previousTmpDir = $env:TMPDIR
 try {
+    # The launcher deliberately rejects GitHub's shared D:\a ancestry. Keep
+    # launcher fixtures and Python-created descendants inside this account.
+    $env:TEMP = $guardRoot
+    $env:TMP = $guardRoot
+    $env:TMPDIR = $guardRoot
     $env:PYTHONUTF8 = "1"           # encode argv/stdio as UTF-8
     $env:CBM_INDEX_SUPERVISOR = "0" # in-process indexing (see .DESCRIPTION)
 
@@ -204,6 +216,9 @@ if (-not $GuardsOnly) {
 }
 } finally {
     Remove-Item -LiteralPath $guardBundle -Recurse -Force -ErrorAction SilentlyContinue
+    $env:TEMP = $previousTemp
+    $env:TMP = $previousTmp
+    $env:TMPDIR = $previousTmpDir
 }
 
 Write-Host ""

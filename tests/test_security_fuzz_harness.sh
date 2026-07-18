@@ -82,12 +82,25 @@ if [[ ! -s "$ENV_LOG" ]]; then
     exit 1
 fi
 
-while IFS=$'\t' read -r child_home child_cache; do
-    if [[ -z "$child_home" || "$child_home" == "$CALLER_HOME" ]]; then
+normalize_path() {
+    local path=${1%$'\r'}
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$path" 2>/dev/null && return 0
+    fi
+    printf '%s\n' "${path//\\//}"
+}
+
+CALLER_HOME_NORMALIZED=$(normalize_path "$CALLER_HOME")
+CALLER_CACHE_NORMALIZED=$(normalize_path "$CALLER_CACHE")
+
+while IFS=$'\t' read -r child_home_raw child_cache_raw; do
+    child_home=$(normalize_path "$child_home_raw")
+    child_cache=$(normalize_path "$child_cache_raw")
+    if [[ -z "$child_home" || "$child_home" == "$CALLER_HOME_NORMALIZED" ]]; then
         echo "FAIL: security-fuzz exposed the caller HOME to a fuzz target"
         exit 1
     fi
-    if [[ -z "$child_cache" || "$child_cache" == "$CALLER_CACHE" ]]; then
+    if [[ -z "$child_cache" || "$child_cache" == "$CALLER_CACHE_NORMALIZED" ]]; then
         echo "FAIL: security-fuzz exposed the caller CBM_CACHE_DIR to a fuzz target"
         exit 1
     fi

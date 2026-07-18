@@ -7,6 +7,7 @@
  */
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "test_daemon_runtime_contract.h"
 
 #include "daemon/application.h"
 #include "daemon/host.h"
@@ -53,6 +54,8 @@ enum {
     RUNTIME_TEST_PATH_CAP = 1024,
     RUNTIME_TEST_LOG_CAP = 4096,
     RUNTIME_TEST_TIMEOUT_MS = 2000,
+    RUNTIME_TEST_CLEANUP_TIMEOUT_MS = 60000,
+    RUNTIME_TEST_CLEANUP_FREE_ATTEMPTS = 3,
     /* Generation-zero rendezvous layout, deliberately repeated rather than
      * derived from production macros so an accidental resize fails loudly. */
     RUNTIME_TEST_RENDEZVOUS_ABI = 1,
@@ -243,6 +246,22 @@ static bool runtime_test_windows_copy_self(const char *destination) {
                   CopyFileW(source, destination_wide, TRUE) != 0;
     free(destination_wide);
     return copied;
+}
+
+static bool runtime_test_windows_wait_image_probe(HANDLE process) {
+    if (!process) {
+        return false;
+    }
+    DWORD wait_status = WaitForSingleObject(process, TF_RUNTIME_IMAGE_WATCHDOG_MS);
+    if (wait_status == WAIT_OBJECT_0) {
+        return true;
+    }
+    (void)TerminateProcess(process, 30);
+    if (WaitForSingleObject(process, RUNTIME_TEST_TIMEOUT_MS) != WAIT_OBJECT_0) {
+        fprintf(stderr, "daemon_runtime copied-image child could not be reaped\n");
+        abort();
+    }
+    return false;
 }
 
 static bool runtime_test_windows_posix_replace(const char *source, const char *destination) {
@@ -657,7 +676,7 @@ static bool runtime_test_run_hello_image(const char *image_path,
                                   NULL, &startup, &process) != 0;
     free(command);
     free(application);
-    bool waited = started && WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0;
+    bool waited = started && runtime_test_windows_wait_image_probe(process.hProcess);
     DWORD exit_code = 0;
     bool read = waited && GetExitCodeProcess(process.hProcess, &exit_code) != 0;
     if (started) {
@@ -671,6 +690,7 @@ static bool runtime_test_run_hello_image(const char *image_path,
 #elif defined(__APPLE__) || defined(__linux__)
     pid_t child = fork();
     if (child == 0) {
+        (void)alarm(TF_RUNTIME_IMAGE_WATCHDOG_SECONDS);
         execl(image_path, image_path, "__cbm_runtime_hello_client", fixture->parent, fixture->key,
               identity->semantic_version, identity->build_fingerprint, (char *)NULL);
         _exit(127);
@@ -722,11 +742,7 @@ static bool runtime_test_run_activation_image(const char *image_path,
                                   NULL, &startup, &process) != 0;
     free(command);
     free(application);
-    bool waited = started && WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0;
-    if (started && !waited) {
-        (void)TerminateProcess(process.hProcess, 30);
-        (void)WaitForSingleObject(process.hProcess, 5000);
-    }
+    bool waited = started && runtime_test_windows_wait_image_probe(process.hProcess);
     DWORD exit_code = 0;
     bool read = waited && GetExitCodeProcess(process.hProcess, &exit_code) != 0;
     if (started) {
@@ -742,7 +758,7 @@ static bool runtime_test_run_activation_image(const char *image_path,
     int action_written = snprintf(action_text, sizeof(action_text), "%u", (unsigned int)action);
     pid_t child = action_written > 0 && action_written < (int)sizeof(action_text) ? fork() : -1;
     if (child == 0) {
-        (void)alarm(10);
+        (void)alarm(TF_RUNTIME_IMAGE_WATCHDOG_SECONDS);
         execl(image_path, image_path, "__cbm_runtime_activation_client", fixture->parent,
               fixture->key, identity->semantic_version, identity->build_fingerprint, action_text,
               (char *)NULL);
@@ -1342,10 +1358,22 @@ static void runtime_test_fixture_finish(runtime_test_fixture_t *fixture) {
     if (fixture->service) {
         cbm_daemon_runtime_service_state_t state =
             cbm_daemon_runtime_service_state(fixture->service);
-        if (state != CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
-            (void)cbm_daemon_runtime_service_stop(fixture->service, RUNTIME_TEST_TIMEOUT_MS);
+        bool stopped =
+            state == CBM_DAEMON_RUNTIME_SERVICE_EXITED ||
+            cbm_daemon_runtime_service_stop(fixture->service, RUNTIME_TEST_CLEANUP_TIMEOUT_MS);
+        bool freed = false;
+        for (size_t attempt = 0; stopped && !freed && attempt < RUNTIME_TEST_CLEANUP_FREE_ATTEMPTS;
+             attempt++) {
+            freed = cbm_daemon_runtime_service_free(fixture->service);
+            if (!freed) {
+                cbm_usleep(1000);
+            }
         }
-        (void)cbm_daemon_runtime_service_free(fixture->service);
+        if (!freed) {
+            fprintf(stderr, "daemon_runtime fixture teardown failed\n");
+            abort();
+        }
+        fixture->service = NULL;
     }
     cbm_daemon_ipc_endpoint_free(fixture->endpoint);
     (void)cbm_unlink(fixture->rotated_log_path);
@@ -1687,6 +1715,74 @@ TEST(daemon_runtime_exact_hello_issues_connection_bound_identity) {
     ASSERT_TRUE(accepted);
     ASSERT_TRUE(identity_anchored);
     ASSERT_TRUE(closed);
+    ASSERT_TRUE(exited);
+    PASS();
+}
+
+TEST(daemon_runtime_unexpected_frame_payload_is_freed_once) {
+    static const uint8_t unexpected_payload[] = {0xde, 0xad, 0xbe, 0xef};
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "unexpected-frame", &identity);
+    cbm_daemon_runtime_connect_result_t owner_result = {0};
+    cbm_daemon_runtime_client_t *owner = NULL;
+    cbm_daemon_ipc_connection_t *raw = NULL;
+    bool raw_connected = false;
+    bool unexpected_sent = false;
+    bool bad_peer_released = false;
+    bool bad_peer_closed = false;
+    bool owner_survived = false;
+    bool owner_closed = false;
+    bool exited = false;
+
+    if (started) {
+        owner = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                  RUNTIME_TEST_TIMEOUT_MS, &owner_result);
+    }
+    if (owner) {
+        raw = runtime_test_raw_client_connect(fixture.endpoint, &identity);
+        raw_connected = raw != NULL;
+    }
+    if (raw) {
+        unexpected_sent = cbm_daemon_ipc_send_frame(
+            raw, CBM_DAEMON_FRAME_RESPONSE, CBM_DAEMON_RUNTIME_OP_HEARTBEAT, unexpected_payload,
+            (uint32_t)sizeof(unexpected_payload));
+    }
+    if (unexpected_sent) {
+        bad_peer_released = cbm_daemon_runtime_service_wait_for_clients(fixture.service, 1,
+                                                                        RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (bad_peer_released) {
+        cbm_daemon_frame_t frame = {0};
+        uint8_t *payload = NULL;
+        int received = cbm_daemon_ipc_receive_frame(raw, RUNTIME_TEST_TIMEOUT_MS, &frame, &payload);
+        bad_peer_closed = received != 1;
+        free(payload);
+        owner_survived = cbm_daemon_runtime_client_heartbeat(owner, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    cbm_daemon_ipc_connection_close(raw);
+    raw = NULL;
+    if (owner) {
+        owner_closed = cbm_daemon_runtime_client_close(owner, RUNTIME_TEST_TIMEOUT_MS);
+        owner = NULL;
+    }
+    if (started) {
+        exited = cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (owner) {
+        (void)cbm_daemon_runtime_client_close(owner, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    cbm_daemon_ipc_connection_close(raw);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(raw_connected);
+    ASSERT_TRUE(unexpected_sent);
+    ASSERT_TRUE(bad_peer_released);
+    ASSERT_TRUE(bad_peer_closed);
+    ASSERT_TRUE(owner_survived);
+    ASSERT_TRUE(owner_closed);
     ASSERT_TRUE(exited);
     PASS();
 }
@@ -4087,6 +4183,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_convenience_service_owns_participant_guard);
     RUN_TEST(daemon_runtime_rendezvous_layout_is_frozen_and_detailed_abi_independent);
     RUN_TEST(daemon_runtime_exact_hello_issues_connection_bound_identity);
+    RUN_TEST(daemon_runtime_unexpected_frame_payload_is_freed_once);
     RUN_TEST(daemon_runtime_activation_rejects_forged_and_malformed_without_stop);
     RUN_TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients);
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)

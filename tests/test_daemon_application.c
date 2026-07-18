@@ -1323,6 +1323,7 @@ static void app_fake_worker_destroy(void *opaque, cbm_daemon_application_worker_
         cbm_usleep(1000);
     }
     (void)app_project_lock_release(&worker->project_lock_lease);
+    cbm_index_worker_result_free(&worker->result);
     free(worker->project_key);
     free(handle);
 }

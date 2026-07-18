@@ -10,6 +10,7 @@ int tf_skip_count = 0;
 
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "test_daemon_runtime_contract.h"
 #include "foundation/compat.h"     /* cbm_setenv — #845 supervisor kill switch */
 #include "foundation/compat_fs.h"  /* cbm_fopen — worker response file */
 #include "foundation/mem.h"        /* cbm_mem_init — worker budget */
@@ -391,10 +392,13 @@ static int tf_maybe_run_runtime_hello_client(int argc, char **argv) {
     cbm_daemon_runtime_connect_result_t result;
     memset(&result, 0, sizeof(result));
     cbm_daemon_runtime_client_t *client =
-        endpoint ? cbm_daemon_runtime_client_connect(endpoint, &identity, 5000, &result) : NULL;
+        endpoint ? cbm_daemon_runtime_client_connect(endpoint, &identity,
+                                                     TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS, &result)
+                 : NULL;
     bool accepted = client && result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED &&
                     result.hello_status == CBM_DAEMON_HELLO_COMPATIBLE;
-    bool closed = !client || cbm_daemon_runtime_client_close(client, 5000);
+    bool closed =
+        !client || cbm_daemon_runtime_client_close(client, TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS);
     cbm_daemon_ipc_endpoint_free(endpoint);
     if (!accepted) {
         return 26;
@@ -425,7 +429,7 @@ static int tf_maybe_run_runtime_activation_client(int argc, char **argv) {
     bool exchanged =
         endpoint && cbm_daemon_runtime_request_activation_shutdown(
                         endpoint, &identity, (cbm_daemon_runtime_activation_action_t)action_value,
-                        5000, &result);
+                        TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS, &result);
     cbm_daemon_ipc_endpoint_free(endpoint);
     return exchanged && result.accepted ? 0 : 29;
 }
