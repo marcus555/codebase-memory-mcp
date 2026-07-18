@@ -8,16 +8,17 @@
 
 services:
   # ── Linux test (ASan + UBSan + LeakSanitizer) ──────────────
-  # cpus defaults to 4 to mirror the GitHub runners: deadline/starvation bugs
-  # (worker-readiness waits, watcher/subprocess deadlines) only reproduce when
-  # the machine is as constrained as CI — 18 free cores mask them. Override
-  # with CBM_LOCAL_CI_CPUS (0 = unconstrained fast mode).
+  # Default: unconstrained (speed first). CBM_LOCAL_CI_CPUS=4 enables
+  # CI-FIDELITY mode, mirroring the 4-core GitHub runners: deadline/starvation
+  # bugs (worker-readiness waits, watcher/subprocess deadlines) only reproduce
+  # under that constraint — run one capped pass before pushing anything that
+  # touches timing, scheduling, or subprocess code.
   test:
     build:
       context: ..
       dockerfile: test-infrastructure/Dockerfile
     platform: linux/arm64
-    cpus: ${CBM_LOCAL_CI_CPUS:-4.0}
+    cpus: ${CBM_LOCAL_CI_CPUS:-0}
     volumes:
       - ..:/src
       - cbm-ccache-arm64:/root/.ccache
@@ -31,7 +32,7 @@ services:
       context: ..
       dockerfile: test-infrastructure/Dockerfile
     platform: linux/amd64
-    cpus: ${CBM_LOCAL_CI_CPUS:-4.0}
+    cpus: ${CBM_LOCAL_CI_CPUS:-0}
     volumes:
       - ..:/src
       - cbm-ccache-amd64:/root/.ccache
