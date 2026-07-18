@@ -40,7 +40,10 @@ mkdir -p "$LOGDIR"
 SUITES_FILE="$LOGDIR/suites.txt"
 RESULTS_FILE="$LOGDIR/results.txt"
 
-if ! "$RUNNER" --list-suites > "$SUITES_FILE"; then
+# tr strips the CR that the Windows CRT appends to every stdout line — a
+# suites file with CRLF endings made the runner reject every name
+# ("arena\r" is an unknown suite) and fail all 104 suites on CI.
+if ! "$RUNNER" --list-suites | tr -d '\r' > "$SUITES_FILE"; then
     echo "FAIL: test-runner --list-suites exited nonzero" >&2
     exit 1
 fi
@@ -49,7 +52,33 @@ if [ "$NSUITES" -lt 1 ] || grep -qvE '^[a-z0-9_]+$' "$SUITES_FILE"; then
     echo "FAIL: suite list empty or malformed (runner too old for --list-suites?)" >&2
     exit 1
 fi
-echo "=== parallel test run: $NSUITES suites, $JOBS jobs ==="
+# Timing-sensitive suites run SEQUENTIALLY after the parallel wave: they
+# spawn subprocesses / watch the filesystem / bind ports with fixed
+# deadlines, and a saturated 4-core CI runner starves those deadlines into
+# flakes (3 cli-suite failures on the ubuntu legs of the first CI run).
+# Same suites, same tests, same gates — only the schedule differs; the
+# union guard below still checks the COMBINED result set.
+# stack_overflow_a/b/c: their giant-recursion ASan allocations stall ~100x
+# when co-STARTED with a large wave on Apple Silicon (2s staggered vs ~230s
+# simultaneous — a local scheduler/zone quirk, not contention: job count
+# does not change it). Staggered in the tail they cost seconds.
+SERIAL_SUITES="cli subprocess watcher incremental httpd ui index_resilience \
+    stack_overflow_a stack_overflow_b stack_overflow_c"
+is_serial() {
+    case " $SERIAL_SUITES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+PAR_FILE="$LOGDIR/suites-parallel.txt"
+SER_FILE="$LOGDIR/suites-serial.txt"
+: > "$PAR_FILE"
+: > "$SER_FILE"
+while IFS= read -r sname; do
+    if is_serial "$sname"; then
+        echo "$sname" >> "$SER_FILE"
+    else
+        echo "$sname" >> "$PAR_FILE"
+    fi
+done < "$SUITES_FILE"
+echo "=== parallel test run: $NSUITES suites ($(wc -l < "$SER_FILE" | tr -d ' ') serial-tail), $JOBS jobs ==="
 
 export RUNNER LOGDIR RESULTS_FILE
 run_one() {
@@ -67,7 +96,11 @@ run_one() {
 }
 export -f run_one
 
-xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} < "$SUITES_FILE"
+xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} < "$PAR_FILE"
+# Serial tail: quiet machine for the deadline-sensitive suites.
+while IFS= read -r sname; do
+    run_one "$sname"
+done < "$SER_FILE"
 
 # ── Union guard: every listed suite produced exactly one result ──
 MISSING=$(comm -23 <(sort "$SUITES_FILE") <(awk '{print $1}' "$RESULTS_FILE" | sort -u))
@@ -88,8 +121,10 @@ echo "── 8 slowest suites ──"
 sort -t= -k6 -rn "$RESULTS_FILE" | head -8
 grep -v ' rc=0 ' "$RESULTS_FILE" || true
 for f in $(grep -v ' rc=0 ' "$RESULTS_FILE" | awk '{print $1}'); do
-    echo "──── $f (last 30 lines) ────"
-    tail -30 "$LOGDIR/$f.log"
+    echo "──── $f: every failure site ────"
+    grep -B2 -A8 "FAIL" "$LOGDIR/$f.log" | head -120
+    echo "──── $f: last 15 lines ────"
+    tail -15 "$LOGDIR/$f.log"
 done
 
 echo "────────────────────────────────────────────"
