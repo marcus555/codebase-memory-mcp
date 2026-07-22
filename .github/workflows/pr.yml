@@ -35,6 +35,10 @@ jobs:
       # Perf assertions are timing-sensitive on shared runners; they stay in
       # dry runs and releases where a flaky red does not block a merge.
       skip_perf: true
+      # Iteration speed: split each C-suite leg across parallel shard jobs
+      # (ubuntu x3, windows x2; coverage re-proven every run by the
+      # shard-completeness job). Dry runs and releases shard identically.
+      shard_suites: true
 
   # ── Which files changed? Gate the (heavier) build+smoke on product code so
   #    docs / CI / test-only PRs stay fast. ──
