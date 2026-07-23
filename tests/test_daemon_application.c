@@ -27,7 +27,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { APP_TEST_TIMEOUT_MS = 2000, APP_TEST_PATH_CAP = 1024 };
+/* Observation-wait budget. This is a HANG DETECTOR, not a latency
+ * assertion: every waiter returns the moment its condition holds, so green
+ * runs never pay it. It must absorb ThreadSanitizer's 5-20x slowdown on a
+ * loaded 3-core CI runner — at 2000 ms the cancel-delivery wait lost the
+ * tail of that distribution once in seven otherwise-green TSan rounds. */
+enum { APP_TEST_TIMEOUT_MS = 10000, APP_TEST_PATH_CAP = 1024 };
 
 typedef struct {
     char runtime_parent[APP_TEST_PATH_CAP];
