@@ -14,6 +14,7 @@
 
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +55,7 @@ static inline int th_write_file(const char *path, const char *content) {
         cbm_mkdir_p(dir, 0755);
     }
 
-    FILE *f = fopen(path, "w");
+    FILE *f = cbm_fopen(path, "wb");
     if (!f) {
         return -1;
     }
@@ -67,7 +68,7 @@ static inline int th_write_file(const char *path, const char *content) {
 
 /* Append content to a file. */
 static inline int th_append_file(const char *path, const char *content) {
-    FILE *f = fopen(path, "a");
+    FILE *f = cbm_fopen(path, "ab");
     if (!f) {
         return -1;
     }
@@ -145,6 +146,32 @@ static inline char *th_mktempdir(const char *prefix) {
         return NULL;
     }
     return buf;
+}
+
+/* Runtime IPC validates the complete Windows directory ancestry, so an MSYS2
+ * TEMP rooted under C:/msys64/tmp is intentionally unsuitable even when the
+ * leaf made by cbm_mkdtemp() has a private DACL. Keep these security-sensitive
+ * fixtures under LocalAppData on Windows; preserve the ordinary temporary-root
+ * behavior on POSIX. */
+static inline bool th_secure_runtime_parent_new(char *out, size_t out_cap, const char *tag) {
+    if (!out || out_cap == 0 || !tag || !tag[0]) {
+        return false;
+    }
+#ifdef _WIN32
+    const char *base = cbm_app_local_dir();
+#else
+    const char *base = cbm_tmpdir();
+#endif
+    if (!base || !base[0]) {
+        out[0] = '\0';
+        return false;
+    }
+    int written = snprintf(out, out_cap, "%s/cbm-runtime-%s-XXXXXX", base, tag);
+    if (written <= 0 || (size_t)written >= out_cap) {
+        out[0] = '\0';
+        return false;
+    }
+    return cbm_mkdtemp(out) != NULL;
 }
 
 /* ── File permissions (no-op on Windows) ──────────────────────── */

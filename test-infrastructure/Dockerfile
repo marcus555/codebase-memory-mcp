@@ -9,14 +9,26 @@
 FROM ubuntu:noble
 
 # Minimal: gcc + zlib only. sqlite3 is vendored (compiled from source with ASan).
+# curl + zsh mirror the GitHub runner images: the self-update tests shell out
+# to curl, and the shell-activation tests exercise zsh rc files.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ make \
     zlib1g-dev \
     pkg-config \
     python3 \
     git \
+    curl \
+    zsh \
+    ccache \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Verified compiler cache: content-keyed (compiler binary + preprocessed
+# input), so a hit is provably the identical compilation — stale results are
+# impossible by construction. The compose services mount a persistent volume
+# at CCACHE_DIR and route compilers through the Debian masquerade dir.
+ENV CCACHE_COMPILERCHECK=content
+ENV PATH=/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /src
 

@@ -5,8 +5,11 @@
  * Covers lexer, parser, and end-to-end execution.
  */
 #include "test_framework.h"
+#include "../src/foundation/compat.h"
+#include "../src/foundation/compat_thread.h"
 #include <cypher/cypher.h>
 #include <store/store.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -836,6 +839,123 @@ TEST(cypher_func_multiarg) {
     PASS();
 }
 
+/* issue #874: coalesce() in WHERE — null-safe numeric filter over an optional
+ * JSON property. Exact repro shape from the issue: nodes lacking the property
+ * fall back to the literal default instead of failing to parse. */
+TEST(cypher_issue874_where_coalesce_numeric) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "DeepLoop",
+                     .qualified_name = "test.DeepLoop",
+                     .file_path = "deep.go",
+                     .properties_json = "{\"transitive_loop_depth\":5}"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Function",
+                     .name = "NoMetrics",
+                     .qualified_name = "test.NoMetrics",
+                     .file_path = "flat.go"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) "
+                                "WHERE coalesce(f.transitive_loop_depth, 0) >= 2 "
+                                "RETURN f.qualified_name LIMIT 10",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1); /* only DeepLoop; NoMetrics coalesces to 0 */
+    ASSERT_STR_EQ(r.rows[0][0], "test.DeepLoop");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* issue #874: coalesce() in WHERE with a string fallback and first-arg-wins. */
+TEST(cypher_issue874_where_coalesce_string) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    /* Missing property on every node → fallback literal matches all 4 Functions */
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WHERE coalesce(f.missing, \"fallback\") = \"fallback\" "
+        "RETURN f.name",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+    cbm_cypher_result_free(&r);
+
+    /* Present first arg wins over the fallback */
+    cbm_cypher_result_t r2 = {0};
+    rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) WHERE coalesce(f.name, \"zz\") = \"HandleOrder\" RETURN f.name",
+        "test", 0, &r2);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r2.row_count, 1);
+    ASSERT_STR_EQ(r2.rows[0][0], "HandleOrder");
+    cbm_cypher_result_free(&r2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* issue #874: function LHS composes with NOT and AND like any other condition. */
+TEST(cypher_issue874_where_coalesce_not_and) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) WHERE NOT coalesce(f.missing, \"x\") = \"x\" RETURN f.name", "test",
+        0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0); /* every node coalesces to "x" — NOT filters all */
+    cbm_cypher_result_free(&r);
+
+    cbm_cypher_result_t r2 = {0};
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) WHERE coalesce(f.missing, \"1\") = \"1\" "
+                            "AND f.name CONTAINS \"Order\" RETURN f.name",
+                            "test", 0, &r2);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r2.row_count, 3); /* HandleOrder, ValidateOrder, SubmitOrder */
+    cbm_cypher_result_free(&r2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* issue #874: the other multi-arg scalar functions work in WHERE too. */
+TEST(cypher_issue874_where_substring) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) WHERE substring(f.name, 0, 6) = \"Handle\" RETURN f.name", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* issue #874: an unrecognised function in WHERE must fail loudly with the
+ * supported set, not the misleading "unexpected operator". */
+TEST(cypher_issue874_where_unsupported_func_error) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc =
+        cbm_cypher_parse("MATCH (f:Function) WHERE foo(f.name) = \"x\" RETURN f.name", &q, &err);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NOT_NULL(err);
+    ASSERT_TRUE(strstr(err, "unsupported function 'foo'") != NULL);
+    free(err);
+    PASS();
+}
+
 TEST(cypher_exists_no_callers) {
     /* NOT EXISTS { (f)<-[:CALLS]-() } → functions with no CALLS caller.
      * HandleOrder has only an incoming DEFINES edge (not CALLS), so it is the
@@ -1464,6 +1584,116 @@ TEST(cypher_edge_prop_access) {
 
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
+    PASS();
+}
+
+typedef struct {
+    atomic_int *ready;
+    atomic_int *start;
+    bool succeeded;
+} cypher_edge_thread_ctx_t;
+
+static void *cypher_edge_props_concurrently(void *opaque) {
+    cypher_edge_thread_ctx_t *ctx = opaque;
+    cbm_store_t *store = setup_cypher_http_store();
+    if (!store) {
+        return NULL;
+    }
+
+    /* Keep projection busy after the store scan has completed.  A single-edge
+     * query can be incidentally ordered by SQLite's internal mutexes, masking
+     * the independent Cypher scratch-buffer race from TSan. */
+    cbm_node_t source = {.project = "test",
+                         .label = "Function",
+                         .name = "HandleOrder",
+                         .qualified_name = "test.main.HandleOrder",
+                         .file_path = "main.go",
+                         .start_line = 10,
+                         .end_line = 30};
+    int64_t source_id = cbm_store_upsert_node(store, &source);
+    for (int i = 0; i < 256; i++) {
+        char name[64];
+        char qualified_name[96];
+        snprintf(name, sizeof(name), "ConcurrentTarget%d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "test.concurrent.%s", name);
+        cbm_node_t target = {.project = "test",
+                             .label = "Function",
+                             .name = name,
+                             .qualified_name = qualified_name,
+                             .file_path = "concurrent.go"};
+        int64_t target_id = cbm_store_upsert_node(store, &target);
+        cbm_edge_t edge = {
+            .project = "test",
+            .source_id = source_id,
+            .target_id = target_id,
+            .type = "HTTP_CALLS",
+            .properties_json =
+                "{\"url_path\":\"/api/orders\",\"confidence\":0.85,\"method\":\"POST\"}"};
+        if (source_id < 0 || target_id < 0 || cbm_store_insert_edge(store, &edge) < 0) {
+            cbm_store_close(store);
+            return NULL;
+        }
+    }
+
+    atomic_fetch_add_explicit(ctx->ready, 1, memory_order_release);
+    while (atomic_load_explicit(ctx->start, memory_order_acquire) == 0) {
+        cbm_usleep(1000);
+    }
+    ctx->succeeded = true;
+    for (int i = 0; i < 128; i++) {
+        cbm_cypher_result_t result = {0};
+        int rc = cbm_cypher_execute(store,
+                                    "MATCH (a:Function)-[r:HTTP_CALLS]->(b:Function) "
+                                    "RETURN r.url_path, r.confidence, r.method",
+                                    "test", 0, &result);
+        if (rc != 0 || result.row_count != 257 ||
+            strcmp(cypher_get_col(&result, 0, "r.url_path"), "/api/orders") != 0 ||
+            strcmp(cypher_get_col(&result, 0, "r.confidence"), "0.85") != 0 ||
+            strcmp(cypher_get_col(&result, 0, "r.method"), "POST") != 0) {
+            ctx->succeeded = false;
+        }
+        cbm_cypher_result_free(&result);
+        if (!ctx->succeeded) {
+            break;
+        }
+    }
+    cbm_store_close(store);
+    return NULL;
+}
+
+/* Daemon sessions execute independent graph queries concurrently. TSan must
+ * see no shared rotating edge-property scratch buffer between those threads. */
+TEST(cypher_edge_prop_storage_is_per_thread) {
+    atomic_int ready;
+    atomic_int start;
+    atomic_init(&ready, 0);
+    atomic_init(&start, 0);
+    cypher_edge_thread_ctx_t ctx[2] = {
+        {.ready = &ready, .start = &start},
+        {.ready = &ready, .start = &start},
+    };
+    cbm_thread_t threads[2];
+    bool started0 = cbm_thread_create(&threads[0], 0, cypher_edge_props_concurrently, &ctx[0]) == 0;
+    bool started1 = cbm_thread_create(&threads[1], 0, cypher_edge_props_concurrently, &ctx[1]) == 0;
+    for (int spins = 0; started0 && started1 && spins < 5000 &&
+                        atomic_load_explicit(&ready, memory_order_acquire) < 2;
+         spins++) {
+        cbm_usleep(1000);
+    }
+    bool both_ready = atomic_load_explicit(&ready, memory_order_acquire) == 2;
+    atomic_store_explicit(&start, 1, memory_order_release);
+    if (started0) {
+        (void)cbm_thread_join(&threads[0]);
+    }
+    if (started1) {
+        (void)cbm_thread_join(&threads[1]);
+    }
+
+    ASSERT_TRUE(started0);
+    ASSERT_TRUE(started1);
+    ASSERT_TRUE(both_ready);
+    ASSERT_TRUE(ctx[0].succeeded);
+    ASSERT_TRUE(ctx[1].succeeded);
     PASS();
 }
 
@@ -2794,6 +3024,59 @@ TEST(cypher_multi_prop_projection_no_alias) {
  * forked child so a stack overwrite (ASan abort, or a raw segfault) shows up
  * as a killing signal instead of taking down the whole runner; the bounded
  * path returns an ordinary error and the child exits cleanly. */
+/* Property projection must return the WHOLE value of composite properties.
+ * json_extract_prop() scanned a non-string value up to the first ',' — so an
+ * array/object property was truncated at its first INTERNAL comma. Real-world
+ * hit: a NestJS handler's decorators
+ *   ["@Roles('OWNER', 'ADMIN')","@Get()"]
+ * projected as ["@Roles('OWNER'   — unusable for route/authz queries. */
+TEST(cypher_exec_prop_array_with_internal_commas) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t n = {.project = "test",
+                    .label = "Method",
+                    .name = "findAll",
+                    .qualified_name = "test.PacienteController.findAll",
+                    .file_path = "paciente.controller.ts",
+                    .properties_json =
+                        "{\"decorators\":[\"@Roles('OWNER', 'ADMIN')\",\"@Get()\"],\"lines\":3}"};
+    cbm_store_upsert_node(s, &n);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (m:Method) RETURN m.decorators, m.lines", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    /* whole array, commas and all — was ["@Roles('OWNER' before the fix */
+    ASSERT_STR_EQ(r.rows[0][0], "[\"@Roles('OWNER', 'ADMIN')\",\"@Get()\"]");
+    ASSERT_STR_EQ(r.rows[0][1], "3"); /* scalar sibling still parses */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A string property must not end at an ESCAPED quote: the scan stopped at the
+ * first '"' regardless of a preceding backslash, cutting the value short. */
+TEST(cypher_exec_prop_string_with_escaped_quote) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "parse",
+                    .qualified_name = "test.parse",
+                    .file_path = "p.ts",
+                    .properties_json = "{\"signature\":\"(sep: \\\"a,b\\\") => void\"}"};
+    cbm_store_upsert_node(s, &n);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.signature", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "(sep: \\\"a,b\\\") => void"); /* was: (sep: \ */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_wide_return_projection_bounded) {
 #ifdef _WIN32
     SKIP_PLATFORM("fork crash-isolation is POSIX-only; the parse-time bound is platform-agnostic");
@@ -2825,6 +3108,54 @@ TEST(cypher_wide_return_projection_bounded) {
     ASSERT_TRUE(WIFEXITED(status));
     PASS();
 #endif
+}
+
+/* #601: an unbounded whole-graph OPTIONAL MATCH / GROUP BY does
+ * O(bindings x groups) work and can run for minutes with no wall-clock guard —
+ * the 100k row ceiling never fires because no rows are produced, so query_graph
+ * just hangs. With the execution deadline armed to trip immediately (budget 0),
+ * the runaway query must abort with a clear error instead of returning a
+ * (misleading, possibly partial) result.
+ *
+ * RED on unfixed code: no deadline exists, so the query completes and returns
+ * rc==0 with rows and no error — the assertions below fail. */
+TEST(cypher_exec_deadline_aborts_runaway_query_issue601) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    cbm_cypher_test_set_deadline_ms(0); /* trip on the first hot-loop check */
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a) OPTIONAL MATCH (a)-[:CALLS]->(b) RETURN a.qualified_name, count(b)", "test",
+        0, &r);
+    cbm_cypher_test_set_deadline_ms(-1); /* restore default before asserting (thread-local) */
+
+    ASSERT_TRUE(rc != 0); /* CBM_NOT_FOUND (-1) — query aborted, not success */
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_TRUE(strstr(r.error, "time limit") != NULL);
+    ASSERT_EQ(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #601 companion: the default (ample) budget must NOT false-positive on a
+ * normal small query — it still returns its rows. */
+TEST(cypher_exec_deadline_allows_normal_query_issue601) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a) OPTIONAL MATCH (a)-[:CALLS]->(b) RETURN a.qualified_name, count(b)", "test",
+        0, &r);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(r.error == NULL);
+    ASSERT_GT(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
 }
 
 /* ══════════════════════════════════════════════════════════════════ */
@@ -2859,6 +3190,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_inline_props);
     RUN_TEST(cypher_parse_error);
     /* Execution */
+    RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
+    RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
     RUN_TEST(cypher_exec_match_all_functions);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_issue237_distinct_order_limit);
@@ -2882,6 +3215,11 @@ SUITE(cypher) {
     RUN_TEST(cypher_func_tointeger_tofloat);
     RUN_TEST(cypher_func_size_reverse);
     RUN_TEST(cypher_func_multiarg);
+    RUN_TEST(cypher_issue874_where_coalesce_numeric);
+    RUN_TEST(cypher_issue874_where_coalesce_string);
+    RUN_TEST(cypher_issue874_where_coalesce_not_and);
+    RUN_TEST(cypher_issue874_where_substring);
+    RUN_TEST(cypher_issue874_where_unsupported_func_error);
     RUN_TEST(cypher_multi_prop_projection_no_alias);
     RUN_TEST(cypher_exists_no_callers);
     RUN_TEST(cypher_exists_has_outgoing_calls);
@@ -2910,6 +3248,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_where_numeric);
     /* Edge property tests (ported from cypher_test.go Feature 2) */
     RUN_TEST(cypher_edge_prop_access);
+    RUN_TEST(cypher_edge_prop_storage_is_per_thread);
     RUN_TEST(cypher_edge_prop_in_where);
     RUN_TEST(cypher_edge_type_prop);
     RUN_TEST(cypher_edge_filter_contains);
@@ -2994,4 +3333,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_unwind);
     RUN_TEST(cypher_parse_unwind_var);
     RUN_TEST(cypher_wide_return_projection_bounded);
+    /* Composite property projection (arrays/objects, escaped quotes) */
+    RUN_TEST(cypher_exec_prop_array_with_internal_commas);
+    RUN_TEST(cypher_exec_prop_string_with_escaped_quote);
 }

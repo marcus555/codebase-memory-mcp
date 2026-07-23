@@ -9,11 +9,15 @@
 
 FROM mstorsjo/llvm-mingw:latest
 
-# Install Wine + binfmt support for transparent .exe execution
-RUN dpkg --add-architecture i386 && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    wine64 curl zstd \
+# curl+zstd are required (zlib sysroot fetch below). Wine is BEST-EFFORT: it
+# only runs the .exe, and its i386 packages are unavailable on an arm64 Docker
+# host (e.g. Colima on Apple Silicon), so a Wine failure must NOT abort the
+# image build - the cross-COMPILE check still works without it.
+RUN apt-get update && apt-get install -y --no-install-recommends curl zstd \
     && rm -rf /var/lib/apt/lists/*
+RUN (dpkg --add-architecture i386 && apt-get update && \
+     apt-get install -y --no-install-recommends wine64 && rm -rf /var/lib/apt/lists/*) \
+    || echo "WARN: Wine unavailable on this host arch -> compile-only mode"
 
 # Install zlib into the llvm-mingw sysroot (from MSYS2 CLANG64 repo)
 RUN mkdir -p /tmp/zlib-pkg && \

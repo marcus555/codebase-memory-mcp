@@ -26,6 +26,11 @@
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768
 
+/* Incremental integrity failure: abort the run and preserve the existing DB.
+ * Distinct from CBM_NOT_FOUND, which the orchestrator uses as the normal
+ * "no incremental route; continue with a full index" sentinel. */
+#define CBM_PIPELINE_ABORT_PRESERVE_DB (-2)
+
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
  * handlers rendezvous on the same Route QN regardless of framework syntax.
@@ -110,6 +115,14 @@ typedef struct {
      * resolve. */
     CBMArena seq_cross_arena;
     bool seq_cross_arena_live;
+
+    /* ObjectScript $$$macro table built from .inc files in the repo (NULL if
+     * no ObjectScript include files were found). Owned by pipeline.c. */
+    const CBMMacroTable *macro_table;
+
+    /* ObjectScript method-return-type table built from extracted definitions
+     * (NULL until pass_calls builds it). Owned by pipeline.c. */
+    const CBMReturnTypeTable *return_type_table;
 } cbm_pipeline_ctx_t;
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
@@ -617,6 +630,22 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
+
+/* Test seam: invoked after a complete staging DB is sealed and immediately
+ * before the cancellation check + atomic replace. Not part of the public API. */
+void cbm_pipeline_set_before_publish_hook_for_tests(
+    cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
+void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
+                                            int (*hook)(const char *, const char *, void *),
+                                            void *ctx);
+
+/* Synchronous thread-local seam for deterministic cross-repo cancellation
+ * tests. The callback runs immediately after a CROSS_* edge is committed and
+ * is never retained; it must not re-enter cross-repo matching. */
+typedef void (*cbm_cross_repo_after_insert_test_hook_t)(const char *project, const char *edge_type,
+                                                        void *context);
+void cbm_cross_repo_set_after_insert_hook_for_tests(cbm_cross_repo_after_insert_test_hook_t hook,
+                                                    void *context);
 
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client

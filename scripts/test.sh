@@ -37,28 +37,67 @@ done
 
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
+# shellcheck source=path-safety.sh
+source "$ROOT/scripts/path-safety.sh"
 
-# Forward CC/CXX and collect make-passthrough args
+# Forward CC/CXX and collect make-passthrough args. BUILD_DIR is honored for
+# the explicit target path below so containerized legs can build in their own
+# directory instead of clobbering the host's native build/c artifacts.
 MAKE_ARGS=""
+BUILD_DIR="build/c"
 for arg in "$@"; do
     case "$arg" in
         CC=*|CXX=*) export "${arg}" ;;
         --arch|--arch=*) ;; # already handled
         arm64|x86_64) ;; # already handled
+        BUILD_DIR=*) BUILD_DIR="${arg#BUILD_DIR=}"; MAKE_ARGS="$MAKE_ARGS $arg" ;;
         *=*) MAKE_ARGS="$MAKE_ARGS $arg" ;; # forward any VAR=VAL to make
     esac
 done
 
 print_env "test.sh"
 
+# Step 0: fast build/security harness regressions run before the compiler-heavy
+# suite. The Windows package surface is static here; native launcher behavior is
+# exercised by scripts/test-windows.ps1.
+echo "=== Step 0a: build directory safety contract ==="
+bash "$ROOT/tests/test_build_dir_safety.sh"
+
+echo "=== Step 0b: Windows VM worktree sync contract ==="
+bash "$ROOT/tests/test_vm_worktree_manifest.sh"
+
+echo "=== Step 0c: UI development proxy security contract ==="
+bash "$ROOT/tests/test_ui_dev_proxy_security.sh"
+
+echo "=== Step 0d: daemon soak recovery contract ==="
+bash "$ROOT/tests/test_soak_daemon_recovery_contract.sh"
+
+echo "=== Step 0e: Windows launcher bundle contract ==="
+bash "$ROOT/tests/test_windows_bundle_contract.sh"
+
+echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
+bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
+
+echo "=== Step 0g: security fuzz harness self-test ==="
+bash "$ROOT/tests/test_security_fuzz_harness.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
-# Step 1: Clean
-scripts/clean.sh
+# Step 1: Clean (scoped to this leg's build directory)
+BUILD_DIR="$BUILD_DIR" scripts/clean.sh
 
-# Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS)
-make -j"$NPROC" -f Makefile.cbm test $MAKE_ARGS
+# Step 2 + 3: Build, then run every suite as parallel processes (identical
+# gate quality — see the ZERO-LOSS CONTRACT in scripts/run-tests-parallel.sh:
+# the suite set is enumerated from the runner itself and union-guarded, and
+# pass/fail/skip totals aggregate to the same numbers as the sequential run).
+# CBM_TEST_SEQUENTIAL=1 restores the single-process runner.
+make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" $MAKE_ARGS
+if [ "${CBM_TEST_SEQUENTIAL:-0}" = "1" ]; then
+    make -f Makefile.cbm test $MAKE_ARGS
+else
+    make -f Makefile.cbm test-par $MAKE_ARGS
+fi
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
 # in a subprocess with a wall-clock timeout — a hang must fail, not block the run.
