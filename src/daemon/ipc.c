@@ -3699,6 +3699,20 @@ static bool win_kernel_mutex_current_user_only(win_security_t *security, HANDLE 
     return valid;
 }
 
+static bool win_security_acl_inherit_children(win_security_t *security) {
+    void *raw_ace = NULL;
+    if (!security || !security->acl || !security->get_ace ||
+        !security->get_ace(security->acl, 0, &raw_ace) || !raw_ace) {
+        return false;
+    }
+    ACE_HEADER *header = raw_ace;
+    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+        return false;
+    }
+    header->AceFlags = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    return true;
+}
+
 struct win_legacy_mutex_guard {
     HANDLE mutex;
     HANDLE ready_event;
@@ -4020,9 +4034,13 @@ static bool win_file_security_secure(win_security_t *security, HANDLE file,
            win_file_acl_secure(security, file, mutation);
 }
 
-static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
+static bool win_runtime_directory_secure(const wchar_t *runtime_dir, bool inherit_children) {
     win_security_t security;
     if (!win_security_init(&security)) {
+        return false;
+    }
+    if (inherit_children && !win_security_acl_inherit_children(&security)) {
+        win_security_destroy(&security);
         return false;
     }
     bool created = CreateDirectoryW(runtime_dir, &security.attributes) != 0;
@@ -4109,7 +4127,8 @@ static bool win_directory_component_secure(win_security_t *security, const wchar
     return valid;
 }
 
-static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
+static bool win_private_directory_tree_secure(const wchar_t *directory_path,
+                                              bool inherit_children) {
     if (!directory_path) {
         return false;
     }
@@ -4183,7 +4202,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
     }
     win_security_destroy(&security);
     if (ok) {
-        ok = win_runtime_directory_secure(path);
+        ok = win_runtime_directory_secure(path, inherit_children);
     }
     free(path);
     return ok;
@@ -4195,7 +4214,7 @@ bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
         return false;
     }
     wchar_t *wide_directory = utf8_to_wide(directory_path);
-    bool secure = wide_directory && win_private_directory_tree_secure(wide_directory);
+    bool secure = wide_directory && win_private_directory_tree_secure(wide_directory, true);
     free(wide_directory);
     return secure;
 }
@@ -4256,7 +4275,7 @@ FILE *cbm_daemon_ipc_private_log_open(const char *directory_path, const char *ba
     wchar_t *wide_path = path ? utf8_to_wide(path) : NULL;
     wchar_t *wide_rotated = rotated_path ? utf8_to_wide(rotated_path) : NULL;
     if (!wide_directory || !path || !rotated_path || !wide_path || !wide_rotated ||
-        !win_private_directory_tree_secure(wide_directory)) {
+        !win_private_directory_tree_secure(wide_directory, false)) {
         free(wide_directory);
         free(path);
         free(rotated_path);
@@ -4420,7 +4439,7 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
     wchar_t *runtime_wide = utf8_to_wide(endpoint->runtime_dir);
     if (!endpoint->runtime_dir || !runtime_wide || !legacy_names_ok ||
         !endpoint->legacy_pipe_name || !endpoint->legacy_startup_mutex_name ||
-        !win_private_directory_tree_secure(runtime_wide)) {
+        !win_private_directory_tree_secure(runtime_wide, false)) {
         free(runtime_wide);
         cbm_daemon_ipc_endpoint_free(endpoint);
         return NULL;

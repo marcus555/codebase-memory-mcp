@@ -796,6 +796,52 @@ TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor)
     PASS();
 }
 
+TEST(daemon_ipc_windows_private_directory_grants_owner_access_to_children) {
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    char child[TEST_PATH_CAP] = {0};
+    bool paths_ok = false;
+    bool secured = false;
+    bool child_created = false;
+    bool child_reopened = false;
+
+    if (ipc_test_parent_new(parent, "win-private-children")) {
+        int cache_written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        int child_written = snprintf(child, sizeof(child), "%s/config.db", cache);
+        paths_ok = cache_written > 0 && cache_written < (int)sizeof(cache) &&
+                   child_written > 0 && child_written < (int)sizeof(child);
+    }
+    if (paths_ok) {
+        secured = cbm_daemon_ipc_private_directory_secure(cache);
+    }
+    if (secured) {
+        HANDLE created =
+            CreateFileA(child, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+        child_created = created != INVALID_HANDLE_VALUE;
+        if (child_created) {
+            (void)CloseHandle(created);
+            HANDLE reopened =
+                CreateFileA(child, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+            child_reopened = reopened != INVALID_HANDLE_VALUE;
+            if (child_reopened) {
+                (void)CloseHandle(reopened);
+            }
+        }
+    }
+
+    (void)DeleteFileA(child);
+    (void)RemoveDirectoryA(cache);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(secured);
+    ASSERT_TRUE(child_created);
+    ASSERT_TRUE(child_reopened);
+    PASS();
+}
+
 TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime) {
     static const char key[] = "91a2b3c4d5e6f708";
     char parent[TEST_PATH_CAP] = {0};
@@ -4582,6 +4628,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_windows_default_endpoint_ignores_temp_environment);
     RUN_TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl);
     RUN_TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor);
+    RUN_TEST(daemon_ipc_windows_private_directory_grants_owner_access_to_children);
     RUN_TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime);
     RUN_TEST(daemon_ipc_windows_local_transition_atomically_reserves_legacy_pipe);
     RUN_TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader);
