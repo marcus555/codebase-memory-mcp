@@ -3554,13 +3554,23 @@ static void *win_token_user_query(win_security_t *security, HANDLE token, PSID *
     return buffer;
 }
 
-#define RESOLVE_ADVAPI_MEMBER(context, member, type, symbol)                   \
-    do {                                                                       \
-        (context)->member = (type)GetProcAddress((context)->advapi, (symbol)); \
-        if (!(context)->member) {                                              \
-            win_security_destroy((context));                                   \
-            return false;                                                      \
-        }                                                                      \
+#define ASSIGN_WINDOWS_PROC(destination, module, symbol)                           \
+    do {                                                                           \
+        HMODULE source_module = (module);                                          \
+        FARPROC resolved = source_module ? GetProcAddress(source_module, (symbol)) \
+                                         : NULL;                                   \
+        _Static_assert(sizeof(destination) == sizeof(resolved),                    \
+                       "Windows function pointer size mismatch");                 \
+        memcpy(&(destination), &resolved, sizeof(destination));                    \
+    } while (0)
+
+#define RESOLVE_ADVAPI_MEMBER(context, member, type, symbol)                  \
+    do {                                                                      \
+        ASSIGN_WINDOWS_PROC((context)->member, (context)->advapi, (symbol));   \
+        if (!(context)->member) {                                             \
+            win_security_destroy((context));                                  \
+            return false;                                                     \
+        }                                                                     \
     } while (0)
 
 static bool win_security_init(win_security_t *security) {
@@ -4618,8 +4628,8 @@ typedef LONG(WINAPI *bcrypt_gen_random_fn)(void *, unsigned char *, ULONG, ULONG
 static bool win_generation_nonce(uint8_t nonce[CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE]) {
     enum { WIN_BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002 };
     HMODULE bcrypt = LoadLibraryW(L"bcrypt.dll");
-    bcrypt_gen_random_fn generate =
-        bcrypt ? (bcrypt_gen_random_fn)GetProcAddress(bcrypt, "BCryptGenRandom") : NULL;
+    bcrypt_gen_random_fn generate = NULL;
+    ASSIGN_WINDOWS_PROC(generate, bcrypt, "BCryptGenRandom");
     LONG status = generate ? generate(NULL, nonce, CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE,
                                       WIN_BCRYPT_USE_SYSTEM_PREFERRED_RNG)
                            : (LONG)-1;
@@ -5173,10 +5183,8 @@ static bool win_pipe_client_is_current_user(HANDLE pipe) {
      * was unusable here: it fails with ERROR_CANNOT_IMPERSONATE until the server
      * has completed a read, which accept must not require. */
     HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
-    get_named_pipe_server_process_id_fn get_client_pid =
-        kernel ? (get_named_pipe_server_process_id_fn)GetProcAddress(kernel,
-                                                                     "GetNamedPipeClientProcessId")
-               : NULL;
+    get_named_pipe_server_process_id_fn get_client_pid = NULL;
+    ASSIGN_WINDOWS_PROC(get_client_pid, kernel, "GetNamedPipeClientProcessId");
     if (!get_client_pid) {
         cbm_log_warn("daemon.accept.client_identity", "step", "pid_fn_missing");
         return false;
@@ -5318,10 +5326,8 @@ int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_
 
 static bool win_pipe_server_is_current_user(HANDLE pipe) {
     HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
-    get_named_pipe_server_process_id_fn get_server_pid =
-        kernel ? (get_named_pipe_server_process_id_fn)GetProcAddress(kernel,
-                                                                     "GetNamedPipeServerProcessId")
-               : NULL;
+    get_named_pipe_server_process_id_fn get_server_pid = NULL;
+    ASSIGN_WINDOWS_PROC(get_server_pid, kernel, "GetNamedPipeServerProcessId");
     ULONG process_id = 0;
     if (!get_server_pid) {
         cbm_log_warn("daemon.client.server_identity", "step", "pid_fn_missing");
@@ -5611,18 +5617,14 @@ uint64_t cbm_daemon_ipc_connection_peer_pid(const cbm_daemon_ipc_connection_t *c
     HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
     ULONG process_id = 0;
     if (connection->role == CBM_DAEMON_IPC_PIPE_ROLE_ACCEPTED_SERVER) {
-        get_named_pipe_client_process_id_fn get_client_pid =
-            kernel ? (get_named_pipe_client_process_id_fn)GetProcAddress(
-                         kernel, "GetNamedPipeClientProcessId")
-                   : NULL;
+        get_named_pipe_client_process_id_fn get_client_pid = NULL;
+        ASSIGN_WINDOWS_PROC(get_client_pid, kernel, "GetNamedPipeClientProcessId");
         if (!get_client_pid || !get_client_pid(connection->handle, &process_id)) {
             return 0;
         }
     } else if (connection->role == CBM_DAEMON_IPC_PIPE_ROLE_CONNECTED_CLIENT) {
-        get_named_pipe_server_process_id_fn get_server_pid =
-            kernel ? (get_named_pipe_server_process_id_fn)GetProcAddress(
-                         kernel, "GetNamedPipeServerProcessId")
-                   : NULL;
+        get_named_pipe_server_process_id_fn get_server_pid = NULL;
+        ASSIGN_WINDOWS_PROC(get_server_pid, kernel, "GetNamedPipeServerProcessId");
         if (!get_server_pid || !get_server_pid(connection->handle, &process_id)) {
             return 0;
         }

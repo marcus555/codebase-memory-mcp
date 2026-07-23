@@ -883,10 +883,16 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
     }
     DWORD needed =
         GetFinalPathNameByHandleW(handle, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-    if (needed == 0 || needed == MAXDWORD || (size_t)needed > SIZE_MAX / sizeof(wchar_t) - 1) {
+    if (needed == 0 || needed == MAXDWORD) {
         (void)CloseHandle(handle);
         return 0;
     }
+#if SIZE_MAX <= UINT32_MAX
+    if ((size_t)needed > SIZE_MAX / sizeof(wchar_t) - 1) {
+        (void)CloseHandle(handle);
+        return 0;
+    }
+#endif
     size_t capacity = (size_t)needed + 1;
     wchar_t *wfull = calloc(capacity, sizeof(*wfull));
     if (!wfull) {

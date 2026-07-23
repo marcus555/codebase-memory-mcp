@@ -352,6 +352,43 @@ You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 | **zlib** | — | macOS: included, Linux: `apt install zlib1g-dev` |
 | **Git** | `git --version` | Pre-installed on most systems |
 
+#### Windows development dependencies (MSYS2 UCRT64)
+
+Windows source builds use the MSYS2 UCRT64 toolchain. These are development-only
+dependencies; pre-built `codebase-memory-mcp` binaries do not require them.
+
+| Purpose | Commands provided | MSYS2 package |
+|---------|-------------------|---------------|
+| Shell build tools | `make` and standard Unix utilities | `base-devel` |
+| C/C++ toolchain | `gcc`, `g++`, linker and debugger tools | `mingw-w64-ucrt-x86_64-toolchain` |
+| Compression headers/library | zlib | `mingw-w64-ucrt-x86_64-zlib` |
+| Source control | `git` | `git` |
+| Clang static analysis and formatting | `clang-tidy`, `clang-format` | `mingw-w64-ucrt-x86_64-clang-tools-extra` |
+| Complementary static analysis | `cppcheck` | `mingw-w64-ucrt-x86_64-cppcheck` |
+| Graph UI build | `node`, `npm` | Node.js 22+ (install separately, or use nvm-windows) |
+
+After installing [MSYS2](https://www.msys2.org/), run the following from
+PowerShell. Change `$msys2` if MSYS2 is installed elsewhere:
+
+```powershell
+$msys2 = "C:\msys64"
+
+& "$msys2\usr\bin\bash.exe" -lc 'pacman -Syu'
+& "$msys2\usr\bin\bash.exe" -lc 'pacman -S --needed base-devel git mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-zlib mingw-w64-ucrt-x86_64-clang-tools-extra mingw-w64-ucrt-x86_64-cppcheck'
+```
+
+Verify the native tools from the same UCRT64 environment:
+
+```powershell
+& "$msys2\usr\bin\bash.exe" -lc 'export PATH=/ucrt64/bin:/usr/bin:/bin:$PATH; gcc --version; g++ --version; make --version; clang-tidy --version; clang-format --version; cppcheck --version'
+node --version
+npm --version
+```
+
+`scripts/lint.sh` requires all three lint executables: `clang-tidy`,
+`clang-format`, and `cppcheck`. `scripts/build.sh --with-ui` additionally
+requires Node.js and npm.
+
 </details>
 
 ```bash

@@ -735,13 +735,16 @@ static void *private_win_token_user_query(private_win_security_t *security, HAND
     return buffer;
 }
 
-#define PRIVATE_RESOLVE_ADVAPI(context, member, type, symbol)                  \
-    do {                                                                       \
-        (context)->member = (type)GetProcAddress((context)->advapi, (symbol)); \
-        if (!(context)->member) {                                              \
-            private_win_security_destroy((context));                           \
-            return false;                                                      \
-        }                                                                      \
+#define PRIVATE_RESOLVE_ADVAPI(context, member, type, symbol)                    \
+    do {                                                                         \
+        FARPROC resolved = GetProcAddress((context)->advapi, (symbol));           \
+        _Static_assert(sizeof((context)->member) == sizeof(resolved),             \
+                       "Windows function pointer size mismatch");                \
+        memcpy(&(context)->member, &resolved, sizeof((context)->member));         \
+        if (!(context)->member) {                                                \
+            private_win_security_destroy((context));                             \
+            return false;                                                        \
+        }                                                                        \
     } while (0)
 
 static bool private_win_security_init(private_win_security_t *security) {
